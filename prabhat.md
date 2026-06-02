@@ -17,6 +17,8 @@ A small library + CLI that reads a `pipeline.yml` file, validates it, and output
 4. A topological sort that produces the execution order
 5. A CLI: `pipectl validate pipeline.yml` and `pipectl plan pipeline.yml`
 
+**note** : Use the yaml config guideline in [YAML_Schema.md](https://github.com/manish-ach/CI-CD-orchestrator/blob/main/YAML-Schema.md)
+
 ## Example input
 
 ```yaml
