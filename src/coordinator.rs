@@ -36,11 +36,21 @@ async fn run(port: u16) {
         workers: HashMap::new(),
     }));
 
+    let reaper_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            reap(&reaper_state);
+        }
+    });
+
     let app = Router::new()
         .route("/", get(root))
         .route("/api/health", get(health))
         .route("/api/workers", get(list_workers))
         .route("/api/workers/register", post(register))
+        .route("/api/workers/heartbeat", post(heartbeat))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -53,6 +63,16 @@ async fn run(port: u16) {
     axum::serve(listener, app)
         .await
         .expect("failed to server content");
+}
+
+fn reap(state: &Arc<Mutex<AppState>>) {
+    let now = Local::now();
+    let mut guard = state.lock().unwrap();
+    for w in guard.workers.values_mut() {
+        if now - w.last_heartbeat > chrono::Duration::seconds(5) {
+            w.status = Status::Offline;
+        }
+    }
 }
 
 async fn root() -> &'static str {
@@ -84,4 +104,15 @@ async fn register(State(state): State<Arc<Mutex<AppState>>>, Json(req): Json<Req
     let mut guard = state.lock().unwrap();
     guard.workers.insert(req.worker_name.clone(), worker);
     println!("Worker Registered");
+}
+
+async fn heartbeat(State(state): State<Arc<Mutex<AppState>>>, Json(req): Json<RequestBody>) {
+    let mut guard = state.lock().unwrap();
+    match guard.workers.get_mut(&req.worker_name) {
+        Some(worker) => {
+            worker.last_heartbeat = Local::now();
+            worker.status = Status::Online;
+        }
+        None => println!("Heartbeat from unknown worker {}", req.worker_name),
+    }
 }
