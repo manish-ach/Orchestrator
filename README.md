@@ -1,7 +1,4 @@
-[ Main repo at https://git.manishacharya.name.np/Manish/Orchestrator.git ]
 # CI/CD Orchestrator
-
-![App screenshot](assets/orchestrator.png)
 
 Distributed CI/CD orchestrator written in Rust. One binary, two modes:
 a coordinator that hands out jobs and tracks workers, and workers that
