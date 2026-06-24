@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 mod coordinator;
 mod types;
 mod worker;
+mod api;
+mod state;
 
 #[derive(Subcommand)]
 enum Module {
@@ -33,6 +35,6 @@ async fn main() {
 
     match args.module {
         Module::Coordinator { port } => coordinator::execute(port).await,
-        Module::Worker { name } => worker::register(name).await,
+        Module::Worker { name } => worker::run(name).await,
     }
 }

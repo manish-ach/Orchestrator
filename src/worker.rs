@@ -1,38 +1,35 @@
 use reqwest::Client;
-use serde::Serialize;
+use crate::types::WorkerRequest;
 
-#[derive(Serialize)]
-struct RequestBody {
-    worker_name: String,
+const COORDINATOR_URL: &str = "127.0.0.1:8080";
+const HEARTBEAT_INTERVAL_SECS: u64 = 2;
+
+pub async fn run(name: String) {
+    let client = Client::new();
+    let body = WorkerRequest{
+        worker_name: name,
+    };
+    register(&client, &body).await;
+    heartbeat(&client, &body).await;
 }
 
-pub async fn register(name: String) {
-    let coordinator = "http://127.0.0.1:8080";
-    let client = Client::new();
-    let register_endpoint = format!("{coordinator}/api/workers/register");
-    let heartbeat_endpoint = format!("{coordinator}/api/workers/heartbeat");
-
-    let body = RequestBody {
-        worker_name: name.clone(),
-    };
-
-    let res = client.post(register_endpoint).json(&body).send().await;
-
-    match res {
-        Ok(r) => println!("Worker registered: {}", r.status()),
-        Err(e) => println!("Error: {}", e),
+async fn register(client: &Client, body: &WorkerRequest) {
+    let endpoint = format!("{COORDINATOR_URL}/api/workers/register");
+    match client.post(endpoint).json(body).send().await {
+        Ok(response) => println!("Worker successfully registered: {}", response.status()),
+        Err(error) => println!("Error: {}", error),
     }
+}
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+async fn heartbeat(client: &Client, body: &WorkerRequest) {
+    let endpoint = format!("{COORDINATOR_URL}/api/workers/heartbeat");
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     loop {
         ticker.tick().await;
-
-        let res = client.post(&heartbeat_endpoint).json(&body).send().await;
-
-        match res {
+        match client.post(&endpoint).json(body).send().await {
             Ok(_r) => println!("Status::Online..."),
-            Err(e) => {
-                println!("heartbeat failed: {}", e);
+            Err(error) => {
+                println!("Error: {}", error);
                 break;
             }
         }

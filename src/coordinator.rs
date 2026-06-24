@@ -1,118 +1,35 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
+use crate::api;
+use crate::state::{AppState, SharedState};
 
-use crate::types::{Status, Worker};
-use axum::{
-    Json, Router,
-    extract::State,
-    routing::{get, post},
-};
-use chrono::Local;
-use serde::{Deserialize, Serialize};
-
-struct AppState {
-    workers: HashMap<String, Worker>,
-}
-
-#[derive(Deserialize)]
-struct RequestBody {
-    worker_name: String,
-}
-
-#[derive(Serialize)]
-struct HealthReport {
-    health: &'static str,
-    online_workers: u16,
-}
+const HEARTBEAT_TIMEOUT_SECS: i64 = 5;
+const REAPER_INTERVAL_SECS: u64 = 2;
 
 pub async fn execute(port: u16) {
-    run(port).await;
-}
+    let state: SharedState = Arc::new(Mutex::new(AppState::new()));
+    spawn_reaper(state.clone());
 
-async fn run(port: u16) {
-    let state = Arc::new(Mutex::new(AppState {
-        workers: HashMap::new(),
-    }));
+    let app = api::router(state);
 
-    let reaper_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-        loop {
-            ticker.tick().await;
-            reap(&reaper_state);
-        }
-    });
-
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/api/health", get(health))
-        .route("/api/workers", get(list_workers))
-        .route("/api/workers/register", post(register))
-        .route("/api/workers/heartbeat", post(heartbeat))
-        .with_state(state);
-
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Port unavailable");
 
-    println!("Coordinator module executed at address: {}", addr);
-
     axum::serve(listener, app)
         .await
-        .expect("failed to server content");
+        .expect("Axum server error");
 }
 
-fn reap(state: &Arc<Mutex<AppState>>) {
-    let now = Local::now();
-    let mut guard = state.lock().unwrap();
-    for w in guard.workers.values_mut() {
-        if now - w.last_heartbeat > chrono::Duration::seconds(5) {
-            w.status = Status::Offline;
+fn spawn_reaper(state: SharedState) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(REAPER_INTERVAL_SECS));
+        loop {
+            ticker.tick().await;
+            state
+                .lock()
+                .unwrap()
+                .reap(chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS))
         }
-    }
-}
-
-async fn root() -> &'static str {
-    "Coordinator module is online\n"
-}
-
-async fn health(State(state): State<Arc<Mutex<AppState>>>) -> Json<HealthReport> {
-    let count = state.lock().unwrap().workers.len() as u16;
-    Json(HealthReport {
-        health: "ok",
-        online_workers: count,
-    })
-}
-
-async fn list_workers(State(state): State<Arc<Mutex<AppState>>>) -> Json<Vec<Worker>> {
-    let guard = state.lock().unwrap();
-    let workers: Vec<Worker> = guard.workers.values().cloned().collect();
-    Json(workers)
-}
-
-async fn register(State(state): State<Arc<Mutex<AppState>>>, Json(req): Json<RequestBody>) {
-    let worker = Worker {
-        name: req.worker_name.clone(),
-        status: Status::Online,
-        last_heartbeat: Local::now(),
-        job_id: None,
-    };
-    println!("{:#?}", worker);
-    let mut guard = state.lock().unwrap();
-    guard.workers.insert(req.worker_name.clone(), worker);
-    println!("Worker Registered");
-}
-
-async fn heartbeat(State(state): State<Arc<Mutex<AppState>>>, Json(req): Json<RequestBody>) {
-    let mut guard = state.lock().unwrap();
-    match guard.workers.get_mut(&req.worker_name) {
-        Some(worker) => {
-            worker.last_heartbeat = Local::now();
-            worker.status = Status::Online;
-        }
-        None => println!("Heartbeat from unknown worker {}", req.worker_name),
-    }
+    });
 }
