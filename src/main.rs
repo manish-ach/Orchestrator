@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod coordinator;
+mod types;
 mod worker;
 
 #[derive(Subcommand)]
@@ -26,11 +27,12 @@ struct Args {
     module: Module,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     match args.module {
-        Module::Coordinator { port } => coordinator::execute(port),
-        Module::Worker { name } => worker::execute(name),
+        Module::Coordinator { port } => coordinator::execute(port).await,
+        Module::Worker { name } => worker::execute(name).await,
     }
 }
