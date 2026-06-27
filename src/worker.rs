@@ -1,7 +1,7 @@
 use reqwest::Client;
 use crate::types::WorkerRequest;
 
-const COORDINATOR_URL: &str = "127.0.0.1:8080";
+const COORDINATOR_URL: &str = "http://127.0.0.1:8080";
 const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 
 pub async fn run(name: String) {
@@ -27,7 +27,7 @@ async fn heartbeat(client: &Client, body: &WorkerRequest) {
     loop {
         ticker.tick().await;
         match client.post(&endpoint).json(body).send().await {
-            Ok(_r) => println!("Status::Online..."),
+            Ok(r) => println!("Status::Online...[{}]", r.status()),
             Err(error) => {
                 println!("Error: {}", error);
                 break;
