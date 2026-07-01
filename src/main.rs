@@ -33,6 +33,6 @@ async fn main() {
 
     match args.module {
         Module::Coordinator { port } => coordinator::execute(port).await,
-        Module::Worker { name } => worker::execute(name).await,
+        Module::Worker { name } => worker::register(name).await,
     }
 }
