@@ -1,8 +1,8 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::{Json, Router};
 use axum::routing::{get, post};
 use crate::state::SharedState;
-use crate::types::{HealthReport, Job, Worker, WorkerRequest};
+use crate::types::{HealthReport, Job, ReportRequest, Worker, WorkerRequest};
 
 pub fn router(state: SharedState) -> Router {
     Router::new()
@@ -14,6 +14,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/pipelines/trigger", post(trigger_pipeline))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/claim", post(claim_job))
+        .route("/api/jobs/{id}/report", post(report_job))
         .with_state(state)
 }
 
@@ -59,4 +60,13 @@ async fn list_jobs(State(state): State<SharedState>) -> Json<Vec<Job>> {
 async fn claim_job(State(state): State<SharedState>, Json(req): Json<WorkerRequest>) -> Json<Option<Job>> {
     let job = state.lock().unwrap().claim_job(req.worker_name);
     Json(job)
+}
+
+async fn report_job(
+    Path(id): Path<u32>,
+    State(state): State<SharedState>,
+    Json(req): Json<ReportRequest>
+) {
+    state.lock().unwrap().report_job(id, req.status.clone());
+    println!("Job {} reported: {:?}", id, req.status);
 }
