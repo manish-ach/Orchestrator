@@ -51,3 +51,14 @@ pub struct WorkerRequest {
     pub worker_name: String,
 }
 
+#[derive(Serialize)]
+pub struct RunRequest {
+    pub command: String,
+    pub timeout: u32
+}
+
+#[derive(Deserialize)]
+pub struct RunResponse {
+    pub output: String,
+    pub status: String,
+}

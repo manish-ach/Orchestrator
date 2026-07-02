@@ -1,8 +1,8 @@
 use reqwest::Client;
-use tokio::process::Command;
-use crate::types::{Job, JobStatus, ReportRequest, WorkerRequest};
+use crate::types::{Job, JobStatus, ReportRequest, RunRequest, RunResponse, WorkerRequest};
 
 const COORDINATOR_URL: &str = "http://127.0.0.1:8080";
+const JOB_RUNNER_URL: &str = "http://127.0.0.1:9000";
 const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 
 pub async fn run(name: String) {
@@ -57,29 +57,24 @@ async fn claim(client: &Client, body: &WorkerRequest) -> Option<Job> {
 }
 
 async fn run_job(client: &Client, job: &Job) {
-    println!("Running job {} [{}]: {}", job.id, job.stage_name, job.command);
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&job.command)
-        .output()
-        .await;
+    println!("Running job: {} [{}]: {}", job.id, job.stage_name, job.command);
 
-    let (status, text) = match output {
-        Ok(out) => {
-            let combined = String::from_utf8_lossy(&out.stdout).to_string();
-            let status = if out.status.success() {
-                JobStatus::Passed
-            } else { JobStatus::Failed };
-            (status, combined)
-        }
-        Err(e) => (JobStatus::Failed, format!("failed to spawn: {e}"))
+    let result: RunResponse = client
+        .post(format!("{JOB_RUNNER_URL}/run"))
+        .json(&RunRequest{ command: job.command.clone(), timeout: 300})
+        .send().await.unwrap()
+        .json().await.unwrap();
+
+    let status = match result.status.as_str() {
+        "passed" => JobStatus::Passed,
+        _ => JobStatus::Failed,
     };
 
     let report = ReportRequest {
         status: status.clone(),
-        output: text,
+        output: result.output,
     };
-    let report_endpoint = format!("{COORDINATOR_URL}/api/jobs/report");
-    let _ = client.post(report_endpoint).json(&report).send().await;
+    let endpoint = format!("{COORDINATOR_URL}/api/jobs/{}/report", job.id);
+    let _ = client.post(&endpoint).json(&report).send().await.unwrap();
     println!("Reported job {} as {:?}", job.id, status);
 }
