@@ -1,39 +1,56 @@
 # CI/CD Orchestrator
 
-Distributed CI/CD orchestrator written in Rust. One binary, two modes:
-a coordinator that hands out jobs and tracks workers, and workers that
-run them.
+Distributed CI/CD platform. A Rust **coordinator** plans pipelines and hands
+out jobs; Rust **workers** claim them and run each command on the FastAPI
+**command executor**. Pipelines are defined in `.orchestrator/actions.yml`
+(validated by the Python **yaml-parser**) and can be triggered manually or
+by a **Forgejo push webhook**. Runs, jobs, and repos persist in **Postgres**;
+the worker registry and ready-job queue live in **Redis**. The Svelte
+**dashboard** is served by the coordinator itself.
 
-This is the coordinator side (work in progress).
+## Run everything (containers)
 
-## Build
+    docker compose up -d --build
+    open http://localhost:8080          # dashboard + API, one origin
 
-    cargo build
+Scale workers: `docker compose up -d --scale worker=3`.
 
-## Run
+## Run natively (dev)
 
-Start the coordinator:
-
+    docker compose up -d postgres redis            # just the stores
     cargo run -- coordinator --port 8080
+    cd command-executor && uv run uvicorn app.main:app --port 9000
+    cargo run -- worker --name rechek              # one per machine
 
-Register a worker (from another terminal):
+Python components use [uv](https://docs.astral.sh/uv/): `uv sync` in
+`yaml-parser/` or `command-executor/` sets up the venv from the lockfile.
 
-    curl -X POST 127.0.0.1:8080/api/workers/register \
-      -H 'Content-Type: application/json' \
-      -d '{"worker_name": "WorkerA"}'
+Worker configuration: `COORDINATOR_URL` and `EXECUTOR_URL` env vars
+(default `http://127.0.0.1:8080` / `http://127.0.0.1:9000`).
 
-List registered workers:
+## Hooking up Forgejo
 
-    curl 127.0.0.1:8080/api/workers
+1. Register the repo in the dashboard (Repos → **+ Add repo**) or:
 
-## Endpoints
+       curl -X POST localhost:8080/api/repos -H 'Content-Type: application/json' \
+         -d '{"remote": "https://git.manishacharya.name.np/Manish/Orchestrator"}'
 
-    GET  /              health text
-    GET  /api/health    worker count
-    POST /api/workers/register
-    GET  /api/workers   list workers
+2. Give the repo a pipeline: commit `.orchestrator/actions.yml` (this repo's
+   own is the reference).
 
-## Status
+3. In Forgejo: repo → Settings → Webhooks → Add webhook → Forgejo,
+   target `http://<coordinator-host>:8080/api/webhooks/forgejo`,
+   content type JSON, trigger on push.
 
-Done: arg parsing, coordinator server, worker registry.
-Next: worker client, job queue, heartbeats, reaper.
+Every push then creates a run (trigger `webhook`, with commit sha/message/
+author) that the dashboard picks up on its next poll.
+
+## Pieces
+
+| Directory           | What                                                      |
+| ------------------- | --------------------------------------------------------- |
+| `src/`              | coordinator + worker binary (axum, sqlx, redis)            |
+| `yaml-parser/`      | pipeline schema/needs/cycle validation + execution planner |
+| `command-executor/` | runs job commands as subprocesses, keeps logs              |
+| `dashboard/`        | Svelte UI; full HTTP contract in dashboard/README.md       |
+| `.orchestrator/`    | this repo's own CI pipeline (actions.yml)                  |

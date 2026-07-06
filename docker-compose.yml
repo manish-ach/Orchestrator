@@ -1,0 +1,85 @@
+# The whole system in containers:
+#
+#   docker compose up -d --build
+#   open http://localhost:8080        (coordinator serves the dashboard too)
+#
+# postgres     — main database: runs, jobs, repos       (localhost:5432)
+# redis        — cache between coordinator and workers:
+#                worker registry + ready-job queue      (localhost:6379)
+# coordinator  — Rust API + dashboard + yaml-parser     (localhost:8080)
+# executor     — FastAPI command executor               (localhost:9000)
+# worker       — claims jobs and hands them to the executor
+#
+# For native dev, `docker compose up -d postgres redis` still works alone.
+
+services:
+  coordinator:
+    build: .
+    container_name: orchestrator-coordinator
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://orchestrator:orchestrator@postgres:5432/orchestrator
+      REDIS_URL: redis://redis:6379
+      # FORGEJO_TOKEN: <for private repos>
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "orchestrator --help > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  executor:
+    build: command-executor
+    container_name: orchestrator-executor
+    ports:
+      - "9000:9000"
+
+  worker:
+    build: .
+    command: ["orchestrator", "worker", "--name", "worker-1"]
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      EXECUTOR_URL: http://executor:9000
+    depends_on:
+      - coordinator
+      - executor
+    restart: unless-stopped
+  postgres:
+    image: postgres:17-alpine
+    container_name: orchestrator-postgres
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator -d orchestrator"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: orchestrator-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:

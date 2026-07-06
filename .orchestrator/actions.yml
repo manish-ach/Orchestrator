@@ -1,0 +1,29 @@
+# CI pipeline for this repo. The coordinator reads this file:
+#  - on POST /api/pipelines/trigger (local checkout, no body)
+#  - on a Forgejo push webhook (fetched from the pushed branch)
+# Validated and planned by yaml-parser; commands run on the command executor.
+name: orchestrator-ci
+stages:
+  - checkout
+  - test
+  - package
+jobs:
+  checkout:
+    stage: checkout
+    image: alpine/git
+    script: rm -rf /tmp/ci && git clone --depth 1 https://git.manishacharya.name.np/Manish/Orchestrator.git /tmp/ci && cd /tmp/ci && git log -1 --oneline
+  validate-pipeline:
+    stage: test
+    image: alpine:latest
+    script: cd /tmp/ci && test -f .orchestrator/actions.yml && echo "pipeline definition present"
+    needs: [checkout]
+  count-rust:
+    stage: test
+    image: alpine:latest
+    script: cd /tmp/ci && wc -l src/*.rs
+    needs: [checkout]
+  package:
+    stage: package
+    image: alpine:latest
+    script: cd /tmp/ci && tar czf /tmp/orchestrator-src.tar.gz src .orchestrator && ls -lh /tmp/orchestrator-src.tar.gz
+    needs: [validate-pipeline, count-rust]

@@ -1,0 +1,21 @@
+[project]
+name = "command-executor"
+version = "0.1.0"
+description = "Single-node job runner: executes CI commands as subprocesses"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+# `app` is run in place, not installed — uv manages the venv only
+[tool.uv]
+package = false
