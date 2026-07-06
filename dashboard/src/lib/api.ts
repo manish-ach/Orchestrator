@@ -34,6 +34,9 @@ export const ENDPOINTS = {
   run: (id: number | string) => `/api/runs/${id}`,
   jobLogs: (id: number | string) => `/api/jobs/${id}/logs`,
   repos: '/api/repos', // GET = list, POST { remote } = register a Forgejo repo
+  repo: (name: string) => `/api/repos/${encodeURIComponent(name)}`, // DELETE = unregister
+  repoPipeline: (name: string, file?: string) =>
+    `/api/repos/${encodeURIComponent(name)}/pipeline${file ? `?file=${encodeURIComponent(file)}` : ''}`,
   calendar: '/api/activity/calendar',
 } as const;
 
@@ -97,6 +100,18 @@ const liveApi: Api = {
 
   async addRepo(remote: string): Promise<Repo> {
     return post<Repo>(ENDPOINTS.repos, { remote });
+  },
+
+  async deleteRepo(name: string): Promise<void> {
+    const res = await fetch(`${API_BASE}${ENDPOINTS.repo(name)}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const reason = await res.text().catch(() => '');
+      throw new Error(reason || `${ENDPOINTS.repo(name)} -> ${res.status}`);
+    }
+  },
+
+  async pipelineFile(repo: string, file?: string): Promise<{ file: string; content: string }> {
+    return get(ENDPOINTS.repoPipeline(repo, file));
   },
 
   async calendar(): Promise<CalendarDay[]> {

@@ -1,29 +1,29 @@
 # CI pipeline for this repo. The coordinator reads this file:
 #  - on POST /api/pipelines/trigger (local checkout, no body)
 #  - on a Forgejo push webhook (fetched from the pushed branch)
-# Validated and planned by yaml-parser; commands run on the command executor.
+#
+# Each job runs in a per-run workspace the executor clones automatically
+# from REPO_URL@COMMIT_SHA (injected by the coordinator) — no checkout job
+# needed. `artifacts:` paths are uploaded to the coordinator when the job
+# passes and downloaded by jobs that `needs` them, even on other machines.
 name: orchestrator-ci
 stages:
-  - checkout
+  - build
   - test
   - package
 jobs:
-  checkout:
-    stage: checkout
+  build-info:
+    stage: build
     image: alpine/git
-    script: rm -rf /tmp/ci && git clone --depth 1 https://git.manishacharya.name.np/Manish/Orchestrator.git /tmp/ci && cd /tmp/ci && git log -1 --oneline
+    artifacts: [build-info.txt]
+    script: git log -1 --oneline > build-info.txt && wc -l src/*.rs >> build-info.txt && cat build-info.txt
   validate-pipeline:
     stage: test
     image: alpine:latest
-    script: cd /tmp/ci && test -f .orchestrator/actions.yml && echo "pipeline definition present"
-    needs: [checkout]
-  count-rust:
-    stage: test
-    image: alpine:latest
-    script: cd /tmp/ci && wc -l src/*.rs
-    needs: [checkout]
+    script: test -f .orchestrator/actions.yml && echo "pipeline definition present"
   package:
     stage: package
     image: alpine:latest
-    script: cd /tmp/ci && tar czf /tmp/orchestrator-src.tar.gz src .orchestrator && ls -lh /tmp/orchestrator-src.tar.gz
-    needs: [validate-pipeline, count-rust]
+    needs: [build-info, validate-pipeline]
+    artifacts: [release.tar.gz]
+    script: tar czf release.tar.gz build-info.txt .orchestrator && ls -lh release.tar.gz

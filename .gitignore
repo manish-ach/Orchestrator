@@ -6,3 +6,5 @@ command-executor/jobs.db
 command-executor/storage/
 .env
 .DS_Store
+.worker-id-*
+artifacts/

@@ -1,15 +1,16 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 
 use crate::forgejo;
 use crate::pipeline::{self, Plan};
 use crate::store::SharedStore;
 use crate::types::{
-    AddRepoRequest, CalendarDay, Commit, HealthReport, Job, Repo, ReportRequest, Run, TriggerKind, TriggerRequest,
-    Worker, WorkerRequest,
+    AddRepoRequest, CalendarDay, ClaimedJob, Commit, HealthReport, Job, RegisterResponse, Repo, ReportRequest, Run,
+    TriggerKind, TriggerRequest, Worker, WorkerRequest,
 };
 
 type ApiError = (StatusCode, String);
@@ -29,13 +30,18 @@ pub fn router(store: SharedStore) -> Router {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/claim", post(claim_job))
         .route("/api/jobs/{id}/report", post(report_job))
+        .route("/api/jobs/{id}/artifacts", post(upload_artifacts).get(download_artifacts))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/jobs/{id}/logs", get(job_logs))
         .route("/api/repos", get(list_repos).post(add_repo))
+        .route("/api/repos/{name}", delete(delete_repo))
+        .route("/api/repos/{name}/pipeline", get(pipeline_file))
         .route("/api/activity/calendar", get(calendar))
         // dashboard dev server runs on another origin (127.0.0.1:4173)
         .layer(CorsLayer::permissive())
+        // artifact tarballs exceed axum's 2MB default body cap
+        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(store);
 
     // Serve the built dashboard when it's around (hash routing — no URL
@@ -65,17 +71,26 @@ async fn list_workers(State(store): State<SharedStore>) -> Result<Json<Vec<Worke
 async fn register(
     State(store): State<SharedStore>,
     Json(req): Json<WorkerRequest>,
-) -> Result<(), ApiError> {
-    store.register(&req.worker_name).await.map_err(internal)?;
-    println!("Worker {} registered successfully!", req.worker_name);
-    Ok(())
+) -> Result<Json<RegisterResponse>, ApiError> {
+    let worker_id = store
+        .register(&req.worker_name, req.worker_id.clone())
+        .await
+        .map_err(internal)?;
+    println!("Worker {} registered as {worker_id}", req.worker_name);
+    Ok(Json(RegisterResponse { worker_id }))
+}
+
+/// Workers identify by id after registration; plain-name callers (demo
+/// scripts) fall back to using the name as the id.
+fn ident(req: &WorkerRequest) -> String {
+    req.worker_id.clone().unwrap_or_else(|| req.worker_name.clone())
 }
 
 async fn heartbeat(
     State(store): State<SharedStore>,
     Json(req): Json<WorkerRequest>,
 ) -> Result<(), ApiError> {
-    let known = store.heartbeat(&req.worker_name).await.map_err(internal)?;
+    let known = store.heartbeat(&ident(&req)).await.map_err(internal)?;
     if !known {
         println!("Worker {} not known!", req.worker_name);
     }
@@ -108,13 +123,37 @@ async fn plan_for_repo(repo: &Repo, branch: &str) -> Result<(Plan, String), ApiE
     ))
 }
 
+/// Everything a trigger resolved: the plan plus where it came from, so the
+/// run can label itself and jobs get REPO_URL/REPO_BRANCH/COMMIT_SHA env.
+struct RunSource {
+    plan: Plan,
+    repo: String,
+    file: String,
+    remote: Option<String>,
+    branch: String,
+}
+
+/// Env injected into every job so pipelines never hardcode their repo:
+/// `git clone $REPO_URL` works in any repo's actions.yml.
+fn run_env(remote: Option<&str>, branch: &str, sha: Option<&str>) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if let Some(remote) = remote {
+        env.insert("REPO_URL".to_string(), remote.to_string());
+    }
+    env.insert("REPO_BRANCH".to_string(), branch.to_string());
+    if let Some(sha) = sha {
+        env.insert("COMMIT_SHA".to_string(), sha.to_string());
+    }
+    env
+}
+
 /// Resolve which pipeline to run: the named repo's YAML from Forgejo; with
 /// no name, the single registered repo, else this checkout's own
 /// .orchestrator/actions.yml. No fake fallback plans.
 async fn resolve_plan(
     store: &SharedStore,
     repo_name: Option<String>,
-) -> Result<(Plan, String, String), ApiError> {
+) -> Result<RunSource, ApiError> {
     // an unregistered name (e.g. retrying an old run) falls through
     let repo = match repo_name {
         Some(name) => store.get_repo(&name).await.map_err(internal)?,
@@ -125,16 +164,18 @@ async fn resolve_plan(
         }
     };
 
-    let mut repo_label: Option<String> = None;
+    let mut fallback: Option<(String, Option<String>, String)> = None;
     if let Some(repo) = repo {
         let branch = repo.branch.clone();
         match plan_for_repo(&repo, &branch).await {
-            Ok((plan, file)) => return Ok((plan, repo.name, file)),
+            Ok((plan, file)) => {
+                return Ok(RunSource { plan, repo: repo.name, file, remote: repo.remote, branch });
+            }
             // not on Forgejo (yet) — fall through to this checkout's own
             // actions.yml, still grouping the run under the repo
             Err((_, reason)) => {
                 println!("{reason}; trying the local .orchestrator/actions.yml");
-                repo_label = Some(repo.name);
+                fallback = Some((repo.name, repo.remote, branch));
             }
         }
     }
@@ -148,8 +189,9 @@ async fn resolve_plan(
     let plan = pipeline::plan_from_yaml(&yaml)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let repo = repo_label.unwrap_or_else(|| plan.name.clone());
-    Ok((plan, repo, ".orchestrator/actions.yml".into()))
+    let (repo, remote, branch) =
+        fallback.unwrap_or_else(|| (plan.name.clone(), None, "main".to_string()));
+    Ok(RunSource { plan, repo, file: ".orchestrator/actions.yml".into(), remote, branch })
 }
 
 async fn trigger_pipeline(
@@ -157,13 +199,14 @@ async fn trigger_pipeline(
     body: Option<Json<TriggerRequest>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let repo_name = body.and_then(|Json(b)| b.repo);
-    let (plan, repo, file) = resolve_plan(&store, repo_name).await?;
+    let src = resolve_plan(&store, repo_name).await?;
 
+    let env = run_env(src.remote.as_deref(), &src.branch, None);
     let id = store
-        .create_run(&plan.name, &repo, &file, TriggerKind::Manual, None, &plan)
+        .create_run(&src.plan.name, &src.repo, &src.file, TriggerKind::Manual, None, &env, &src.plan)
         .await
         .map_err(internal)?;
-    println!("Triggered run {id}: pipeline '{}' from {file} ({} jobs)", plan.name, plan.jobs.len());
+    println!("Triggered run {id}: pipeline '{}' from {} ({} jobs)", src.plan.name, src.file, src.plan.jobs.len());
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
@@ -232,9 +275,17 @@ async fn forgejo_webhook(
             }
         });
 
+    // full sha (not the 7-char display one) so checkout jobs can pin to it
+    let full_sha = payload
+        .pointer("/head_commit/id")
+        .or_else(|| payload.get("after"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     let (plan, file) = plan_for_repo(&repo, &branch).await?;
+    let env = run_env(repo.remote.as_deref(), &branch, full_sha.as_deref());
     let id = store
-        .create_run(&plan.name, &repo.name, &file, TriggerKind::Webhook, commit.as_ref(), &plan)
+        .create_run(&plan.name, &repo.name, &file, TriggerKind::Webhook, commit.as_ref(), &env, &plan)
         .await
         .map_err(internal)?;
     println!(
@@ -253,8 +304,39 @@ async fn list_jobs(State(store): State<SharedStore>) -> Result<Json<Vec<Job>>, A
 async fn claim_job(
     State(store): State<SharedStore>,
     Json(req): Json<WorkerRequest>,
-) -> Result<Json<Option<Job>>, ApiError> {
-    Ok(Json(store.claim_job(&req.worker_name).await.map_err(internal)?))
+) -> Result<Json<Option<ClaimedJob>>, ApiError> {
+    Ok(Json(
+        store.claim_job(&ident(&req), &req.worker_name).await.map_err(internal)?,
+    ))
+}
+
+fn artifacts_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("ARTIFACTS_DIR").unwrap_or_else(|_| "artifacts".into()))
+}
+
+/// Executors upload a job's declared outputs here as one tar.gz; dependent
+/// jobs (possibly on other machines) download it back. The coordinator is
+/// the only file transport between devices.
+async fn upload_artifacts(
+    Path(id): Path<i64>,
+    State(store): State<SharedStore>,
+    body: axum::body::Bytes,
+) -> Result<(), ApiError> {
+    let dir = artifacts_dir();
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| internal(e.to_string()))?;
+    tokio::fs::write(dir.join(format!("{id}.tar.gz")), &body)
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+    store.mark_artifacts(id).await.map_err(internal)?;
+    println!("Artifacts stored for job {id} ({} bytes)", body.len());
+    Ok(())
+}
+
+async fn download_artifacts(Path(id): Path<i64>) -> Result<axum::body::Bytes, ApiError> {
+    tokio::fs::read(artifacts_dir().join(format!("{id}.tar.gz")))
+        .await
+        .map(axum::body::Bytes::from)
+        .map_err(|_| (StatusCode::NOT_FOUND, format!("no artifacts stored for job {id}")))
 }
 
 async fn report_job(
@@ -310,6 +392,63 @@ async fn add_repo(
     store.upsert_repo(&repo).await.map_err(internal)?;
     println!("Repo {}/{} registered", repo.owner, repo.name);
     Ok(Json(repo))
+}
+
+async fn delete_repo(
+    Path(name): Path<String>,
+    State(store): State<SharedStore>,
+) -> Result<StatusCode, ApiError> {
+    if store.delete_repo(&name).await.map_err(internal)? {
+        println!("Repo {name} unregistered");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("repo '{name}' is not registered")))
+    }
+}
+
+#[derive(Deserialize)]
+struct PipelineFileQuery {
+    file: Option<String>,
+}
+
+/// Raw pipeline YAML for a repo, proxied from Forgejo so the browser never
+/// talks to it directly. ?file= pins a specific path; otherwise the known
+/// candidates are probed in order.
+async fn pipeline_file(
+    Path(name): Path<String>,
+    Query(q): Query<PipelineFileQuery>,
+    State(store): State<SharedStore>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let repo = store
+        .get_repo(&name)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, format!("repo '{name}' is not registered")))?;
+    let remote = repo.remote.clone().ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("repo '{name}' has no remote configured"),
+    ))?;
+
+    let candidates: Vec<String> = match q.file {
+        Some(file) => vec![file],
+        None => {
+            let mut c: Vec<String> = repo.pipelines.iter().map(|p| p.file.clone()).collect();
+            c.extend(forgejo::PIPELINE_FILES.iter().map(|f| f.to_string()));
+            c.dedup();
+            c
+        }
+    };
+
+    let client = reqwest::Client::new();
+    for file in candidates {
+        if let Some(content) = forgejo::fetch_raw_file(&client, &remote, &repo.branch, &file).await {
+            return Ok(Json(serde_json::json!({ "file": file, "content": content })));
+        }
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("no pipeline file found on '{}' — push .orchestrator/actions.yml first", repo.branch),
+    ))
 }
 
 async fn calendar(State(store): State<SharedStore>) -> Result<Json<Vec<CalendarDay>>, ApiError> {

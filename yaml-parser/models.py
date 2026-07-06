@@ -8,6 +8,9 @@ class Job(BaseModel):
     script: str
     needs: List[str] = Field(default_factory=list)
     env: Dict[str, str] = Field(default_factory=dict)
+    # workspace paths uploaded when the job passes; downloaded by jobs
+    # that `needs` this one (possibly on another machine)
+    artifacts: List[str] = Field(default_factory=list)
 
 
 class Pipeline(BaseModel):

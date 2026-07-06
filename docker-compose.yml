@@ -21,7 +21,10 @@ services:
     environment:
       DATABASE_URL: postgres://orchestrator:orchestrator@postgres:5432/orchestrator
       REDIS_URL: redis://redis:6379
+      ARTIFACTS_DIR: /app/artifacts
       # FORGEJO_TOKEN: <for private repos>
+    volumes:
+      - artifacts:/app/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,3 +86,4 @@ services:
 volumes:
   pgdata:
   redisdata:
+  artifacts:

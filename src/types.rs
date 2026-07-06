@@ -81,12 +81,29 @@ pub struct Job {
     pub needs: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// workspace paths uploaded to the coordinator when the job passes
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub has_artifacts: bool,
     pub status: JobStatus,
     pub worker: Option<String>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub exit_code: Option<i32>,
     pub output: Option<String>,
+}
+
+/// What claim hands a worker: the job plus which dependency jobs have
+/// artifacts waiting on the coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimedJob {
+    #[serde(flatten)]
+    pub job: Job,
+    #[serde(default)]
+    pub input_jobs: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,9 +135,11 @@ pub struct HealthReport {
 }
 
 /// Worker as the API serves it; `last_heartbeat` is ms epoch per the
-/// dashboard contract. Live state lives in Redis.
+/// dashboard contract. Live state lives in Redis, keyed by the unique id
+/// minted at first registration.
 #[derive(Debug, Clone, Serialize)]
 pub struct Worker {
+    pub id: String,
     pub name: String,
     pub status: Status,
     pub last_heartbeat: i64,
@@ -130,13 +149,30 @@ pub struct Worker {
 #[derive(Serialize, Deserialize)]
 pub struct WorkerRequest {
     pub worker_name: String,
+    /// unique id from a previous registration; absent on first contact
+    #[serde(default)]
+    pub worker_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub worker_id: String,
+}
+
+/// Worker -> executor. Beyond the command itself: which per-run workspace
+/// to run in (auto-cloned from repo_url@commit_sha), which artifact
+/// bundles to pull in first, and which paths to upload where afterwards.
 #[derive(Serialize)]
 pub struct RunRequest {
     pub command: String,
     pub timeout: u32,
     pub env: std::collections::HashMap<String, String>,
+    pub workspace: Option<String>,
+    pub repo_url: Option<String>,
+    pub commit_sha: Option<String>,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub upload_url: Option<String>,
 }
 
 #[derive(Deserialize)]
