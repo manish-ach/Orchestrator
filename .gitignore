@@ -1,1 +1,8 @@
 /target
+__pycache__/
+*.pyc
+.venv/
+command-executor/jobs.db
+command-executor/storage/
+.env
+.DS_Store

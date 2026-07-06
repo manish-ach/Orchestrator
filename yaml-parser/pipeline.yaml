@@ -1,0 +1,14 @@
+name: demo
+stages:
+  - build
+  - test
+jobs:
+  compile:
+    stage: build
+    image: rust:latest
+    script: cargo build
+  unit-tests:
+    stage: test
+    image: rust:latest
+    script: cargo test
+    needs: [compile]

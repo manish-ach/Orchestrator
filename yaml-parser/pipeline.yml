@@ -1,0 +1,24 @@
+name: demo-app
+stages:
+  - build
+  - test
+  - deploy
+jobs:
+  compile:
+    stage: build
+    image: rust:latest
+    script: cargo build --release
+  lint:
+    stage: build
+    image: rust:latest
+    script: cargo clippy
+  unit-tests:
+    stage: test
+    image: rust:latest
+    script: cargo test
+    needs: [compile]
+  ship:
+    stage: deploy
+    image: alpine:latest
+    script: ./deploy.sh
+    needs: [unit-tests, lint]

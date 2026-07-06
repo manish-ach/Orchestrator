@@ -1,0 +1,20 @@
+[project]
+name = "yaml-parser"
+version = "0.1.0"
+description = "Pipeline parser and validator"
+requires-python = ">=3.11"
+
+dependencies = [
+    "pyyaml",
+    "pydantic",
+    "typer",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+# flat scripts, not an installable package — uv manages the venv only
+[tool.uv]
+package = false
