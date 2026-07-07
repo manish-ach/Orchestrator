@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+jobs.db
+storage/logs/
