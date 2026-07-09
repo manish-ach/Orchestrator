@@ -8,7 +8,7 @@ pub enum Status {
     Offline,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Pending,
@@ -17,13 +17,19 @@ pub enum JobStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: u32,
     pub stage_name: String,
     pub command: String,
     pub status: JobStatus,
     pub assigned_worker: Option<String>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ReportRequest {
+    pub status: JobStatus,
+    pub output: String,
 }
 
 #[derive(Serialize)]

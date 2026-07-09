@@ -85,9 +85,29 @@ impl AppState {
             .find(|j| matches!(j.status, JobStatus::Pending))?;
 
         job.status = JobStatus::Running;
-        job.assigned_worker = Some(worker_name);
-
+        job.assigned_worker = Some(worker_name.clone());
         let claim = job.clone();
+
+        if let Some(worker) = self.workers.get_mut(&worker_name) {
+            worker.job_id = Some(job.id);
+        }
         Some(claim)
+    }
+
+    pub fn report_job(&mut self, job_id: u32, job_status: JobStatus) {
+        let worker_name = {
+            let job = match self.jobs.iter_mut().find(|j| j.id == job_id) {
+                Some(job) => job,
+                None => return,
+            };
+            job.status = job_status;
+            job.assigned_worker.clone()
+        };
+
+        if let Some(worker) = worker_name {
+            if let Some(w) = self.workers.get_mut(&worker) {
+                w.job_id = None;
+            }
+        }
     }
 }
