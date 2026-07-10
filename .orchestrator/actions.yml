@@ -41,6 +41,9 @@ jobs:
     needs: [package]
     env:
       JOB_TIMEOUT: "3600"
+      # must run on the server's own worker — other machines have no
+      # docker socket / stack checkout mounted
+      WORKER_PIN: worker-1
     script: |
       [ "$REPO_BRANCH" = "main" ] || { echo "push was to '$REPO_BRANCH' — only main deploys"; exit 0; }
       [ -n "$HOST_STACK_DIR" ] || { echo "HOST_STACK_DIR is not set on the executor — self-deploy is not enabled on this server (README: Self-deploy)"; exit 1; }

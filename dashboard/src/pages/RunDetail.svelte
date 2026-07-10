@@ -114,6 +114,28 @@
     if (logFollow && logBody) logBody.scrollTop = logBody.scrollHeight;
   });
 
+  // full logs of every job in the selected stage (stage view, no job
+  // selected) — refetched on each poll so running jobs tail live
+  let stageLogs = $state<Record<number, LogLine[]>>({});
+  $effect(() => {
+    const r = run;
+    const stage = view;
+    if (!r || stage === 'overview' || jobSel !== null) {
+      stageLogs = {};
+      return;
+    }
+    const started = r.jobs.filter((j) => j.stage === stage && (j.started_at || j.finished_at));
+    let cancelled = false;
+    Promise.all(
+      started.map((j) => api.job(r.id, j.id).then((d) => [j.id, d?.log ?? []] as const)),
+    ).then((entries) => {
+      if (!cancelled) stageLogs = Object.fromEntries(entries);
+    });
+    return () => {
+      cancelled = true;
+    };
+  });
+
   function onLogScroll() {
     if (!logBody) return;
     const atBottom = logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 24;
@@ -136,6 +158,35 @@
       retrying = false;
     }
   }
+
+  // ---- pipeline YAML viewer -----------------------------------------------------
+  let showYaml = $state(false);
+  let yaml = $state<{ file: string; content: string } | null>(null);
+  let yamlError = $state('');
+  // string keys so the effect refires only when the run actually changes,
+  // not on every poll's fresh run object
+  const yamlRepo = $derived(run?.repo ?? null);
+  const yamlFile = $derived(run && /\.ya?ml$/.test(run.pipeline_file) ? run.pipeline_file : null);
+
+  $effect(() => {
+    const repo = yamlRepo;
+    const file = yamlFile;
+    if (!showYaml || !repo) return;
+    yaml = null;
+    yamlError = '';
+    let cancelled = false;
+    api.pipelineFile(repo, file ?? undefined).then(
+      (d) => {
+        if (!cancelled) yaml = d;
+      },
+      (e) => {
+        if (!cancelled) yamlError = (e as Error).message;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
 
   // ---- pan / zoom canvas ------------------------------------------------------
   let pan = $state({ x: 0, y: 0 });
@@ -292,7 +343,15 @@
         <div class="card flow-card-canvas">
           <div class="flow-head">
             <span class="glabel">Pipeline execution flow</span>
-            <span class="fname" title={run.pipeline_file}>{run.pipeline_file.split('/').pop()}</span>
+            <button
+              type="button"
+              class="fname fname-btn"
+              title={run.repo ? `${run.pipeline_file} — click to ${showYaml ? 'hide' : 'view'} the file` : 'this run has no registered repo to fetch the file from'}
+              disabled={!run.repo}
+              onclick={() => (showYaml = !showYaml)}
+            >
+              {run.pipeline_file.split('/').pop()}{showYaml ? ' ▴' : ' ▾'}
+            </button>
             <span class="fon">on: {run.trigger === 'webhook' ? 'push' : run.trigger}</span>
             <span class="zoom-ctrls">
               <button class="zoombtn" onclick={() => zoomCenter(1 / 1.2)} aria-label="Zoom out">−</button>
@@ -301,6 +360,21 @@
               <button class="zoombtn fit" onclick={() => { pan = { x: 0, y: 0 }; scale = 1; }}>reset</button>
             </span>
           </div>
+          {#if showYaml}
+            <div class="yaml-view">
+              {#if yamlError}
+                <div class="empty">{yamlError}</div>
+              {:else if !yaml}
+                <div class="empty">fetching pipeline file…</div>
+              {:else}
+                <div class="yaml-head">
+                  <span class="mono">{yaml.file}</span>
+                  <span class="dim">current version on the repo — the run may have used an older commit</span>
+                </div>
+                <pre class="yaml-pre">{yaml.content}</pre>
+              {/if}
+            </div>
+          {/if}
           <div
             class="flow-canvas"
             class:grabbing={dragging !== null}
@@ -453,6 +527,42 @@
                   {/each}
                 </div>
               {/if}
+
+              <div class="section-label" style="margin-top:20px">Command logs
+                <span class="meta">full output of every job in {view}</span>
+              </div>
+              {#each jobs as j (j.id)}
+                {@const jlog = stageLogs[j.id] ?? []}
+                <div class="term stage-term" class:failed={j.status === 'failed'}>
+                  <div class="term-head">
+                    <span class="dot" aria-hidden="true"></span>{j.worker ?? 'unassigned'}
+                    <span class="tjob" title={j.name}>{j.status === 'failed' ? `${GLYPH.failed} ` : ''}{j.name}</span>
+                  </div>
+                  <div class="term-body full stage-log" role="log" aria-label="Log for {j.name}">
+                    {#each jlog as l, i (i)}
+                      <div class="lnrow" class:err={l.err} class:ok={l.ok}>
+                        <span class="lnum" aria-hidden="true">{i + 1}</span>
+                        <span class="ltxt">{l.t || ' '}</span>
+                      </div>
+                    {:else}
+                      <div class="lnrow">
+                        <span class="lnum" aria-hidden="true"></span>
+                        <span class="ltxt" style="color:var(--term-muted)">
+                          {j.started_at || j.finished_at ? 'no output yet' : 'queued — waiting for a worker'}
+                        </span>
+                      </div>
+                    {/each}
+                  </div>
+                  <div class="term-foot">
+                    <span class="tcmd" title="$ {j.command}">$ {j.command}</span>
+                    {#if j.status === 'running'}
+                      <span class="tlines streaming">streaming…</span>
+                    {:else}
+                      <span class="tlines">{jlog.length} lines · <button type="button" class="siv-link" onclick={() => selectJob(j)}>open</button></span>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
             {/if}
           </div>
 

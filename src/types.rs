@@ -173,6 +173,9 @@ pub struct RunRequest {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub upload_url: Option<String>,
+    /// coordinator endpoint the executor POSTs the growing log to while
+    /// the job runs, so the dashboard can tail it live
+    pub progress_url: Option<String>,
 }
 
 #[derive(Deserialize)]

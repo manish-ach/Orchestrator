@@ -1,7 +1,9 @@
 # app/main.py
 
+import asyncio
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -54,6 +56,9 @@ class RunRequest(BaseModel):
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     upload_url: str | None = None
+    # coordinator URL to POST the growing log to while the job runs, so
+    # the dashboard can tail it live
+    progress_url: str | None = None
 
 
 @app.post("/run", tags=["Sync"])
@@ -75,7 +80,25 @@ async def run_sync(req: RunRequest):
         command = f'cd "{ws}" && ({req.command})'
 
     job_id = runner.create_job(command, env=req.env, timeout=req.timeout)
-    status = await runner.run_job(job_id)
+    run_task = asyncio.create_task(runner.run_job(job_id))
+
+    # live tail: while the command runs, push the accumulated log to the
+    # coordinator every couple of seconds; failures are ignored (the full
+    # output still arrives with the worker's final report)
+    if req.progress_url:
+        async with httpx.AsyncClient(timeout=10) as client:
+            last = ""
+            while not run_task.done():
+                await asyncio.wait({run_task}, timeout=2)
+                current = runner.read_logs(job_id) or ""
+                if current and current != last:
+                    last = current
+                    try:
+                        await client.post(req.progress_url, json={"output": current})
+                    except httpx.HTTPError:
+                        pass
+
+    status = await run_task
     job = runner.get_job(job_id)
     output = runner.read_logs(job_id) or ""
 

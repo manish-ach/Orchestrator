@@ -30,6 +30,7 @@ pub fn router(store: SharedStore) -> Router {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/claim", post(claim_job))
         .route("/api/jobs/{id}/report", post(report_job))
+        .route("/api/jobs/{id}/progress", post(job_progress))
         .route("/api/jobs/{id}/artifacts", post(upload_artifacts).get(download_artifacts))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
@@ -346,6 +347,23 @@ async fn report_job(
 ) -> Result<(), ApiError> {
     store.report_job(id, &req).await.map_err(internal)?;
     println!("Job {} reported: {:?}", id, req.status);
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct ProgressReport {
+    output: String,
+}
+
+/// Live tail from the executor while a job runs; the dashboard's normal
+/// log polling picks it up, so long jobs stream instead of appearing all
+/// at once at the end.
+async fn job_progress(
+    Path(id): Path<i64>,
+    State(store): State<SharedStore>,
+    Json(req): Json<ProgressReport>,
+) -> Result<(), ApiError> {
+    store.job_progress(id, &req.output).await.map_err(internal)?;
     Ok(())
 }
 

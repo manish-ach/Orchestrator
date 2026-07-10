@@ -35,21 +35,6 @@
   let yaml = $state<{ file: string; content: string } | null>(null);
   let yamlError = $state('');
 
-  async function toggleYaml() {
-    showYaml = !showYaml;
-    if (!showYaml) return;
-    yaml = null;
-    yamlError = '';
-    try {
-      // only pin the file when it's a real path (history-derived entries
-      // can carry placeholders like "(default)")
-      const file = pipeline?.file.match(/\.ya?ml$/) ? pipeline.file : undefined;
-      yaml = await api.pipelineFile(name, file);
-    } catch (e) {
-      yamlError = (e as Error).message;
-    }
-  }
-
   // deleting the repo (runs stay in history)
   let deleting = $state(false);
 
@@ -105,6 +90,31 @@
   });
 
   const pipeRuns = $derived(pipeline ? repoRuns.filter((r) => r.pipeline === pipeline.name) : []);
+
+  // which file the YAML viewer should show — a string key so the effect below
+  // only refires on a real switch, not on every poll's fresh repo objects.
+  // history-derived entries can carry placeholders like "(default)"; those
+  // let the coordinator probe its known candidates instead of pinning a path.
+  const yamlKey = $derived(pipeline ? (/\.ya?ml$/.test(pipeline.file) ? pipeline.file : '') : null);
+
+  $effect(() => {
+    const key = yamlKey;
+    if (!showYaml || key === null) return;
+    yaml = null;
+    yamlError = '';
+    let cancelled = false;
+    api.pipelineFile(name, key || undefined).then(
+      (d) => {
+        if (!cancelled) yaml = d;
+      },
+      (e) => {
+        if (!cancelled) yamlError = (e as Error).message;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
 
   function runDuration(r: Run): number {
     return (r.finished_at ?? Date.now()) - r.started_at;
@@ -241,7 +251,7 @@
               aria-label="Search runs in this pipeline"
               bind:value={query}
             />
-            <button class="btn" onclick={toggleYaml} disabled={!pipeline && !repo.remote}>
+            <button class="btn" onclick={() => (showYaml = !showYaml)} disabled={!pipeline && !repo.remote}>
               {showYaml ? 'hide file' : 'view file'}
             </button>
           </div>
