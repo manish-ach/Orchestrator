@@ -562,6 +562,8 @@ function buildCalendar(): CalendarDay[] {
 
 // Repos registered through the + Add repo form while in mock mode.
 const addedRepos: Repo[] = [];
+// Repos removed via delete while in mock mode.
+const deletedRepos = new Set<string>();
 
 export const mockApi: Api = {
   async calendar(): Promise<CalendarDay[]> {
@@ -576,7 +578,25 @@ export const mockApi: Api = {
         .filter(([, p]) => p.repo === name)
         .map(([pname, p]) => ({ name: pname, file: p.file })),
     }));
-    return [...builtin, ...addedRepos];
+    return [...builtin, ...addedRepos].filter((r) => !deletedRepos.has(r.name));
+  },
+  async deleteRepo(name: string): Promise<void> {
+    deletedRepos.add(name);
+  },
+  async pipelineFile(repo: string, file?: string): Promise<{ file: string; content: string }> {
+    return {
+      file: file ?? '.orchestrator/actions.yml',
+      content: [
+        `# simulated — switch to ?mode=live for the real file`,
+        `name: ${repo}-ci`,
+        `stages: [build, test, deploy]`,
+        `jobs:`,
+        `  build:`,
+        `    stage: build`,
+        `    image: rust:latest`,
+        `    script: cargo build --release`,
+      ].join('\n'),
+    };
   },
   async addRepo(remote: string): Promise<Repo> {
     const m = remote

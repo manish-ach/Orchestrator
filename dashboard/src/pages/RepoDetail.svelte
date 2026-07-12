@@ -8,6 +8,7 @@
   import Strip from '../lib/components/Strip.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
   import { now, startPolling } from '../lib/poll';
+  import { navigate } from '../lib/router';
   import type { Overview, Repo, Run } from '../lib/types';
 
   let { name }: { name: string } = $props();
@@ -28,6 +29,41 @@
   let selectedPipeline = $state<string | null>(null);
   let query = $state('');
   let ddOpen = $state(false);
+
+  // pipeline YAML viewer
+  let showYaml = $state(false);
+  let yaml = $state<{ file: string; content: string } | null>(null);
+  let yamlError = $state('');
+
+  async function toggleYaml() {
+    showYaml = !showYaml;
+    if (!showYaml) return;
+    yaml = null;
+    yamlError = '';
+    try {
+      // only pin the file when it's a real path (history-derived entries
+      // can carry placeholders like "(default)")
+      const file = pipeline?.file.match(/\.ya?ml$/) ? pipeline.file : undefined;
+      yaml = await api.pipelineFile(name, file);
+    } catch (e) {
+      yamlError = (e as Error).message;
+    }
+  }
+
+  // deleting the repo (runs stay in history)
+  let deleting = $state(false);
+
+  async function deleteRepo() {
+    if (!window.confirm(`Unregister ${name} from the dashboard?\nIts run history stays; the repo is no longer polled or triggerable.`)) return;
+    deleting = true;
+    try {
+      await api.deleteRepo(name);
+      navigate('/repos');
+    } catch (e) {
+      error = (e as Error).message;
+      deleting = false;
+    }
+  }
 
   const stop = startPolling(async () => {
     try {
@@ -205,7 +241,24 @@
               aria-label="Search runs in this pipeline"
               bind:value={query}
             />
+            <button class="btn" onclick={toggleYaml} disabled={!pipeline && !repo.remote}>
+              {showYaml ? 'hide file' : 'view file'}
+            </button>
           </div>
+
+          {#if showYaml}
+            <div class="yaml-view">
+              {#if yamlError}
+                <div class="empty">{yamlError}</div>
+              {:else if !yaml}
+                <div class="empty">fetching pipeline file…</div>
+              {:else}
+                <div class="yaml-head"><span class="mono">{yaml.file}</span><span class="dim">@ {repo.branch}</span></div>
+                <pre class="yaml-pre">{yaml.content}</pre>
+              {/if}
+            </div>
+          {/if}
+
           <div>
             {#if !shownRuns.length}
               <div class="empty" style="margin:16px 0">
@@ -247,6 +300,12 @@
           </div>
           <div class="about-row"><span class="sik">default branch</span><span class="siv">{repo.branch}</span></div>
           <div class="about-row"><span class="sik">owner</span><span class="siv">@{repo.owner}</span></div>
+          <div class="repo-danger">
+            <button class="btn btn-danger" onclick={deleteRepo} disabled={deleting}>
+              {deleting ? 'removing…' : 'Delete repo'}
+            </button>
+            <span class="dim">runs stay in history</span>
+          </div>
         </section>
 
         <section class="card side-sec">

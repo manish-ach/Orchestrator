@@ -25,6 +25,9 @@ export interface Job {
   started_at: number | null;
   finished_at: number | null;
   exit_code: number | null;
+  /** declared artifact paths; uploaded to the coordinator when passed */
+  artifacts?: string[];
+  has_artifacts?: boolean;
   /** mock-only: planned duration used by the simulator */
   planned?: number;
 }
@@ -44,6 +47,8 @@ export interface Run {
 }
 
 export interface Worker {
+  /** unique id minted at first registration */
+  id?: string;
   name: string;
   status: WorkerState;
   last_heartbeat: number;
@@ -110,5 +115,9 @@ export interface Api {
   repos(): Promise<Repo[]>;
   /** register a repo by its Forgejo URL; resolves to the fetched repo */
   addRepo(remote: string): Promise<Repo>;
+  /** unregister a repo (its runs stay in history) */
+  deleteRepo(name: string): Promise<void>;
+  /** raw pipeline YAML for a repo, proxied through the coordinator */
+  pipelineFile(repo: string, file?: string): Promise<{ file: string; content: string }>;
   calendar(): Promise<CalendarDay[]>;
 }

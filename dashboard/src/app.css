@@ -218,6 +218,8 @@ code, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
 }
 .btn-lime:hover { background: var(--lime-hover); border-color: var(--lime-hover); }
 .btn-lime:active { background: var(--lime-hover); }
+.btn-danger { color: var(--fail); border-color: currentColor; }
+.btn-danger:hover { background: var(--fail-bg); }
 
 /* ---- stat tiles (inside band) ---- */
 
@@ -899,6 +901,37 @@ main.wide-wrap { padding-top: 26px; }
   margin: 0 0 16px;
 }
 .repo-add .repo-add-input { flex: 1; width: auto; }
+
+/* pipeline YAML viewer (repo page) */
+.yaml-view { margin: 14px 0 4px; }
+.yaml-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.yaml-pre {
+  background: var(--term-bg);
+  color: var(--term-ink);
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-x: auto;
+  max-height: 420px;
+  margin: 0;
+}
+
+.repo-danger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
 
 .repo-list {
   display: flex;
