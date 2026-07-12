@@ -1,0 +1,12 @@
+name: self-dependency
+
+stages:
+  - build
+
+jobs:
+  compile:
+    stage: build
+    image: python:3.11
+    script: echo Hello
+    needs:
+      - compile

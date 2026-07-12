@@ -1,0 +1,19 @@
+name: cyclic-pipeline
+
+stages:
+  - build
+
+jobs:
+  job-a:
+    stage: build
+    image: python:3.11
+    script: echo A
+    needs:
+      - job-b
+
+  job-b:
+    stage: build
+    image: python:3.11
+    script: echo B
+    needs:
+      - job-a

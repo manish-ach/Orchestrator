@@ -1,0 +1,10 @@
+name: invalid-stage
+
+stages:
+  - build
+
+jobs:
+  test:
+    stage: deploy
+    image: python:3.11
+    script: pytest
