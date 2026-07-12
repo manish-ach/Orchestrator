@@ -74,14 +74,11 @@ async fn run_job(client: &Client, job: &Job) {
     // A dead or broken runner must still produce a report, otherwise the
     // job stays "running" on the coordinator forever.
     let result = match response {
-        Ok(resp) => match resp.json::<RunResponse>().await {
-            Ok(body) => body,
-            Err(error) => RunResponse {
-                output: format!("job runner returned an invalid response: {error}"),
-                status: "failed".to_string(),
-                exit_code: None,
-            },
-        },
+        Ok(resp) => resp.json::<RunResponse>().await.unwrap_or_else(|error| RunResponse {
+            output: format!("job runner returned an invalid response: {error}"),
+            status: "failed".to_string(),
+            exit_code: None,
+        }),
         Err(error) => RunResponse {
             output: format!("could not reach job runner at {}: {error}", executor_url()),
             status: "failed".to_string(),
