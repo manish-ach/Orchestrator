@@ -5,6 +5,7 @@ use crate::forgejo;
 use crate::store::{SharedStore, Store};
 
 const REPO_REFRESH_SECS: u64 = 120;
+const RECONCILE_INTERVAL_SECS: u64 = 5;
 
 pub async fn execute(port: u16) {
     let store = match Store::connect().await {
@@ -20,6 +21,7 @@ pub async fn execute(port: u16) {
         println!("Queue reconcile failed: {error}");
     }
     spawn_repo_registry(store.clone());
+    spawn_reconciler(store.clone());
 
     let app = api::router(store);
 
@@ -32,6 +34,20 @@ pub async fn execute(port: u16) {
     axum::serve(listener, app)
         .await
         .expect("Axum server error");
+}
+
+// Steals work back from dead workers: drains their personal queues and
+// requeues their running jobs so a lost laptop doesn't strand a run.
+fn spawn_reconciler(store: SharedStore) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
+        loop {
+            ticker.tick().await;
+            if let Err(error) = store.reconcile().await {
+                println!("Reconcile failed: {error}");
+            }
+        }
+    });
 }
 
 // Refreshes Forgejo metadata for every registered repo so the dashboard

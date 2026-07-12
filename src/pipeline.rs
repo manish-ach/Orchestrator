@@ -21,6 +21,9 @@ pub struct PlanJob {
     pub needs: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// workspace paths to upload as artifacts when the job passes
+    #[serde(default)]
+    pub artifacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

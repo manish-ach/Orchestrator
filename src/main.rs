@@ -19,6 +19,12 @@ enum Module {
     Worker {
         #[arg(long)]
         name: String,
+        ///Coordinator address, e.g. http://192.168.1.10:8080 [env: COORDINATOR_URL]
+        #[arg(long)]
+        coordinator: Option<String>,
+        ///Command executor address on this machine [env: EXECUTOR_URL]
+        #[arg(long)]
+        executor: Option<String>,
     },
 }
 
@@ -37,6 +43,6 @@ async fn main() {
 
     match args.module {
         Module::Coordinator { port } => coordinator::execute(port).await,
-        Module::Worker { name } => worker::run(name).await,
+        Module::Worker { name, coordinator, executor } => worker::run(name, coordinator, executor).await,
     }
 }
