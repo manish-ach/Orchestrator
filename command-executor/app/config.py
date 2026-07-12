@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # Storage
     LOGS_DIR: str = str(BASE_DIR / "storage" / "logs")
+    WORKSPACES_DIR: str = str(BASE_DIR / "storage" / "workspaces")
 
     # Job Execution
     DEFAULT_TIMEOUT: int = 300  # seconds
@@ -34,4 +35,5 @@ settings = Settings()
 
 # Ensure directories exist
 Path(settings.LOGS_DIR).mkdir(parents=True, exist_ok=True)
+Path(settings.WORKSPACES_DIR).mkdir(parents=True, exist_ok=True)
 #Nimesh Giri

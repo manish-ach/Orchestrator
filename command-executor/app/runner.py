@@ -4,11 +4,16 @@
 # Log output goes to LOGS_DIR/<job_id>.log so it survives restarts.
 
 import asyncio
+import io
 import json
 import os
+import tarfile
 import time
 import uuid
+from collections import defaultdict
 from pathlib import Path
+
+import httpx
 
 from app.config import settings
 from app.db.session import get_db
@@ -17,6 +22,67 @@ from app.db.session import get_db
 RUNNING: dict[str, asyncio.subprocess.Process] = {}
 # job_ids killed via /cancel, so run_job reports "cancelled" not "failed"
 CANCELLED: set[str] = set()
+# one lock per workspace so parallel jobs of a run don't race the clone
+_WS_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+class WorkspaceError(RuntimeError):
+    """Raised when a workspace cannot be prepared or artifacts moved."""
+
+
+async def _sh(command: str, cwd: str | None = None) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_shell(
+        command, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out.decode(errors="replace")
+
+
+async def prepare_workspace(name: str, repo_url: str | None, commit_sha: str | None) -> Path:
+    """Materialize a per-run workspace on THIS machine: clone once, reuse
+    for every later job of the run that lands here."""
+    ws = Path(settings.WORKSPACES_DIR) / name
+    async with _WS_LOCKS[name]:
+        if not ws.exists():
+            if not repo_url:
+                ws.mkdir(parents=True, exist_ok=True)
+                return ws
+            code, out = await _sh(f'git clone "{repo_url}" "{ws}"')
+            if code != 0:
+                raise WorkspaceError(f"workspace clone failed: {out.strip()}")
+            if commit_sha:
+                code, out = await _sh(f'git checkout -q "{commit_sha}"', cwd=str(ws))
+                if code != 0:
+                    raise WorkspaceError(f"checkout of {commit_sha[:7]} failed: {out.strip()}")
+    return ws
+
+
+async def fetch_artifacts(url: str, ws: Path) -> None:
+    """Download a dependency's artifact bundle from the coordinator and
+    unpack it into the workspace — how files cross machine boundaries."""
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(url)
+        if resp.status_code != 200:
+            raise WorkspaceError(f"artifact download failed ({resp.status_code}) from {url}")
+        with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+            tar.extractall(ws)
+
+
+async def upload_artifacts(ws: Path, paths: list[str], url: str) -> int:
+    """Bundle declared output paths and push them to the coordinator."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for p in paths:
+            full = ws / p
+            if not full.exists():
+                raise WorkspaceError(f"declared artifact '{p}' was not produced by the job")
+            tar.add(full, arcname=p)
+    data = buf.getvalue()
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, content=data)
+        if resp.status_code >= 300:
+            raise WorkspaceError(f"artifact upload failed ({resp.status_code})")
+    return len(data)
 
 
 def _now_ms() -> int:
