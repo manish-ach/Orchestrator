@@ -1,35 +1,57 @@
-use std::sync::{Arc, Mutex};
-use crate::api;
-use crate::state::{AppState, SharedState};
+use std::sync::Arc;
 
-const HEARTBEAT_TIMEOUT_SECS: i64 = 5;
-const REAPER_INTERVAL_SECS: u64 = 2;
+use crate::api;
+use crate::forgejo;
+use crate::store::{SharedStore, Store};
+
+const REPO_REFRESH_SECS: u64 = 120;
 
 pub async fn execute(port: u16) {
-    let state: SharedState = Arc::new(Mutex::new(AppState::new()));
-    spawn_reaper(state.clone());
+    let store = match Store::connect().await {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("Could not reach the backing stores: {error}");
+            eprintln!("Start them with:  docker compose up -d");
+            std::process::exit(1);
+        }
+    };
 
-    let app = api::router(state);
+    if let Err(error) = store.reconcile_queue().await {
+        println!("Queue reconcile failed: {error}");
+    }
+    spawn_repo_registry(store.clone());
+
+    let app = api::router(store);
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Port unavailable");
 
+    println!("Coordinator listening on {addr} (Postgres + Redis connected)");
     axum::serve(listener, app)
         .await
         .expect("Axum server error");
 }
 
-fn spawn_reaper(state: SharedState) {
+// Refreshes Forgejo metadata for every registered repo so the dashboard
+// stays fresh without hammering Forgejo on each 3s poll.
+fn spawn_repo_registry(store: SharedStore) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(REAPER_INTERVAL_SECS));
+        let client = reqwest::Client::new();
         loop {
-            ticker.tick().await;
-            state
-                .lock()
-                .unwrap()
-                .reap(chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS))
+            let remotes = store.repo_remotes().await.unwrap_or_default();
+            for remote in &remotes {
+                match forgejo::fetch_repo(&client, remote).await {
+                    Ok(repo) => {
+                        if let Err(error) = store.upsert_repo(&repo).await {
+                            println!("Repo save failed for {remote}: {error}");
+                        }
+                    }
+                    Err(error) => println!("Repo refresh failed for {remote}: {error}"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(REPO_REFRESH_SECS)).await;
         }
     });
 }

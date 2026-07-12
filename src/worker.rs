@@ -1,9 +1,16 @@
 use reqwest::Client;
 use crate::types::{Job, JobStatus, ReportRequest, RunRequest, RunResponse, WorkerRequest};
 
-const COORDINATOR_URL: &str = "http://127.0.0.1:8080";
-const JOB_RUNNER_URL: &str = "http://127.0.0.1:9000";
 const HEARTBEAT_INTERVAL_SECS: u64 = 2;
+
+// Overridable so containerized / multi-machine workers can find their peers.
+fn coordinator_url() -> String {
+    std::env::var("COORDINATOR_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into())
+}
+
+fn executor_url() -> String {
+    std::env::var("EXECUTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".into())
+}
 
 pub async fn run(name: String) {
     let client = Client::new();
@@ -26,7 +33,7 @@ pub async fn run(name: String) {
 }
 
 async fn register(client: &Client, body: &WorkerRequest) {
-    let endpoint = format!("{COORDINATOR_URL}/api/workers/register");
+    let endpoint = format!("{}/api/workers/register", coordinator_url());
     match client.post(endpoint).json(body).send().await {
         Ok(response) => println!("Worker successfully registered: {}", response.status()),
         Err(error) => println!("Error: {}", error),
@@ -34,7 +41,7 @@ async fn register(client: &Client, body: &WorkerRequest) {
 }
 
 async fn heartbeat(client: &Client, body: &WorkerRequest) {
-    let endpoint = format!("{COORDINATOR_URL}/api/workers/heartbeat");
+    let endpoint = format!("{}/api/workers/heartbeat", coordinator_url());
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     loop {
         ticker.tick().await;
@@ -49,7 +56,7 @@ async fn heartbeat(client: &Client, body: &WorkerRequest) {
 }
 
 async fn claim(client: &Client, body: &WorkerRequest) -> Option<Job> {
-    let endpoint = format!("{COORDINATOR_URL}/api/jobs/claim");
+    let endpoint = format!("{}/api/jobs/claim", coordinator_url());
     match client.post(endpoint).json(body).send().await {
         Ok(resp) => resp.json::<Option<Job>>().await.unwrap_or(None),
         Err(_) => None,
@@ -57,13 +64,30 @@ async fn claim(client: &Client, body: &WorkerRequest) -> Option<Job> {
 }
 
 async fn run_job(client: &Client, job: &Job) {
-    println!("Running job: {} [{}]: {}", job.id, job.stage_name, job.command);
+    println!("Running job: {} [{}]: {}", job.id, job.stage, job.command);
 
-    let result: RunResponse = client
-        .post(format!("{JOB_RUNNER_URL}/run"))
-        .json(&RunRequest{ command: job.command.clone(), timeout: 300})
-        .send().await.unwrap()
-        .json().await.unwrap();
+    let response = client
+        .post(format!("{}/run", executor_url()))
+        .json(&RunRequest{ command: job.command.clone(), timeout: 300, env: job.env.clone() })
+        .send().await;
+
+    // A dead or broken runner must still produce a report, otherwise the
+    // job stays "running" on the coordinator forever.
+    let result = match response {
+        Ok(resp) => match resp.json::<RunResponse>().await {
+            Ok(body) => body,
+            Err(error) => RunResponse {
+                output: format!("job runner returned an invalid response: {error}"),
+                status: "failed".to_string(),
+                exit_code: None,
+            },
+        },
+        Err(error) => RunResponse {
+            output: format!("could not reach job runner at {}: {error}", executor_url()),
+            status: "failed".to_string(),
+            exit_code: None,
+        },
+    };
 
     let status = match result.status.as_str() {
         "passed" => JobStatus::Passed,
@@ -73,8 +97,16 @@ async fn run_job(client: &Client, job: &Job) {
     let report = ReportRequest {
         status: status.clone(),
         output: result.output,
+        // runner may not send an exit code; derive one so the dashboard
+        // always has a value to show
+        exit_code: result.exit_code.or(Some(match status {
+            JobStatus::Passed => 0,
+            _ => 1,
+        })),
     };
-    let endpoint = format!("{COORDINATOR_URL}/api/jobs/{}/report", job.id);
-    let _ = client.post(&endpoint).json(&report).send().await.unwrap();
-    println!("Reported job {} as {:?}", job.id, status);
+    let endpoint = format!("{}/api/jobs/{}/report", coordinator_url(), job.id);
+    match client.post(&endpoint).json(&report).send().await {
+        Ok(_) => println!("Reported job {} as {:?}", job.id, status),
+        Err(error) => println!("Failed to report job {}: {error}", job.id),
+    }
 }

@@ -4,7 +4,9 @@ mod coordinator;
 mod types;
 mod worker;
 mod api;
-mod state;
+mod store;
+mod pipeline;
+mod forgejo;
 
 #[derive(Subcommand)]
 enum Module {
