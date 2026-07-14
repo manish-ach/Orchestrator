@@ -45,8 +45,9 @@ jobs:
     artifacts: [prebuilt.tar.gz]
     env:
       JOB_TIMEOUT: "3600"
-      # the platform the SERVER runs on — change if it isn't x86_64
-      TARGET_PLATFORM: linux/amd64
+      # the platform the SERVER runs on (`uname -m` there) — nxtcloud-m
+      # is aarch64
+      TARGET_PLATFORM: linux/arm64
     script: |
       # non-main pushes don't deploy, so don't burn 10 minutes compiling;
       # ship an empty bundle to keep the declared artifact satisfied
@@ -98,6 +99,18 @@ jobs:
         echo "no usable prebuilt artifacts — compiling on this machine (slow path)"
       fi
       docker compose --project-directory /host/stack build
+      # never swap to an image that can't even exec on this machine — a
+      # prebuilt binary for the wrong TARGET_PLATFORM dies with exit 255
+      # and would take the whole stack down
+      if ! docker run --rm orchestrator-coordinator orchestrator --help > /dev/null 2>&1; then
+        if [ -n "$ORCHESTRATOR_DOCKERFILE" ]; then
+          echo "prebuilt image failed its smoke test (TARGET_PLATFORM vs 'uname -m' mismatch?) — rebuilding from source"
+          unset ORCHESTRATOR_DOCKERFILE
+          docker compose --project-directory /host/stack build
+        fi
+        docker run --rm orchestrator-coordinator orchestrator --help > /dev/null \
+          || { echo "built image cannot run on this machine — aborting deploy, old stack keeps running"; exit 1; }
+      fi
       docker run -d --rm \
         -v /var/run/docker.sock:/var/run/docker.sock \
         -v "$HOST_STACK_DIR":/host/stack \

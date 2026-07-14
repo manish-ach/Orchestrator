@@ -25,6 +25,8 @@ services:
       context: .
       dockerfile: ${ORCHESTRATOR_DOCKERFILE:-Dockerfile}
     container_name: orchestrator-coordinator
+    # a broken image must keep retrying visibly, not vanish from docker ps
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
@@ -52,6 +54,7 @@ services:
   executor:
     build: command-executor
     container_name: orchestrator-executor
+    restart: unless-stopped
     ports:
       - "9000:9000"
 
