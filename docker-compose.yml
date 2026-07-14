@@ -27,6 +27,10 @@ services:
       REDIS_URL: redis://redis:6379
       ARTIFACTS_DIR: /app/artifacts
       # FORGEJO_TOKEN: <for private repos>
+      # Set both to put the dashboard behind a login screen (workers and
+      # webhooks are unaffected):
+      # DASHBOARD_USERNAME: admin
+      # DASHBOARD_PASSWORD: change-me
     volumes:
       - artifacts:/app/artifacts
     depends_on:
@@ -52,6 +56,13 @@ services:
     environment:
       COORDINATOR_URL: http://coordinator:8080
       EXECUTOR_URL: http://executor:9000
+      # keeps the worker id across rebuilds so the registry doesn't fill
+      # with offline duplicates of this worker
+      WORKER_STATE_DIR: /state
+      # capability labels that pipeline `tags:` match against, e.g.
+      # WORKER_TAGS: heavy,docker
+    volumes:
+      - workerstate:/state
     depends_on:
       - coordinator
       - executor
@@ -91,3 +102,4 @@ volumes:
   pgdata:
   redisdata:
   artifacts:
+  workerstate:

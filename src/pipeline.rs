@@ -24,6 +24,12 @@ pub struct PlanJob {
     /// workspace paths to upload as artifacts when the job passes
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// pin to one worker by name (sugar for env WORKER_PIN)
+    #[serde(default)]
+    pub worker: Option<String>,
+    /// capability labels — only workers carrying all of them may run this
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -6,6 +6,11 @@
 # from REPO_URL@COMMIT_SHA (injected by the coordinator) — no checkout job
 # needed. `artifacts:` paths are uploaded to the coordinator when the job
 # passes and downloaded by jobs that `needs` them, even on other machines.
+#
+# Placement:
+#   worker: <name>   — pin a job to one worker by its --name
+#   tags: [heavy]    — run only on a worker started with matching
+#                      --tags/WORKER_TAGS (waits if none is online)
 name: orchestrator-ci
 stages:
   - build

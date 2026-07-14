@@ -3,7 +3,7 @@
   import { api, MODE } from '../lib/api';
   import { activity, deviceStats, type Activity, type BusyInterval } from '../lib/charts';
   import Topbar from '../lib/components/Topbar.svelte';
-  import { ago, fmtDur, GLYPH } from '../lib/format';
+  import { ago, fmtDur, fmtUptime, GLYPH } from '../lib/format';
   import { now, startPolling } from '../lib/poll';
   import type { Overview, Worker } from '../lib/types';
 
@@ -30,10 +30,12 @@
   const workers = $derived(overview?.workers ?? []);
   const total = $derived(Math.max(workers.length, 1));
 
-  function busyAt(a: Activity, t: number): number {
+  // count a worker for the slice when any of its jobs overlaps it — point
+  // sampling at the midpoint misses jobs shorter than a slice entirely
+  function busyDuring(a: Activity, t0: number, t1: number): number {
     let n = 0;
     for (const list of a.byWorker.values()) {
-      if (list.some((iv) => iv.start <= t && t <= iv.end)) n++;
+      if (list.some((iv) => iv.start < t1 && iv.end > t0)) n++;
     }
     return n;
   }
@@ -42,9 +44,9 @@
     if (!act) return [];
     const step = act.windowMs / BUCKETS;
     return Array.from({ length: BUCKETS }, (_, i) => {
-      const mid = act.t0 + (i + 0.5) * step;
-      const busy = busyAt(act, mid);
-      return { busy, when: Math.round((act.now - mid) / 60000) };
+      const bs = act.t0 + i * step;
+      const busy = busyDuring(act, bs, bs + step);
+      return { busy, when: Math.round((act.now - (bs + step / 2)) / 60000) };
     });
   });
   const anyActivity = $derived(bars.some((b) => b.busy > 0));
@@ -131,8 +133,14 @@
     <span class="meta">timeline: ✓ passed · ✕ failed · running extends to now</span>
   </div>
   <div class="devices">
+    {#if act && !workers.length}
+      <div class="empty">
+        No workers registered — start one with
+        <code>orchestrator worker --name w1 --coordinator http://&lt;host&gt;:8080</code>.
+      </div>
+    {/if}
     {#if act}
-      {#each workers as w (w.name)}
+      {#each workers as w (w.id ?? w.name)}
         {@const st = stats(w.name)}
         {@const run = runningIv(w.name)}
         {@const fail = lastFail(w.name)}
@@ -144,7 +152,19 @@
             {:else if run}<span class="wc-badge busy">busy</span>
             {:else}<span class="wc-badge idle">idle</span>{/if}
           </div>
-          <div class="wc-seen"><span class="dot" aria-hidden="true"></span>last seen {ago(w.last_heartbeat, $now)}</div>
+          <div class="wc-seen">
+            <span class="dot" aria-hidden="true"></span>
+            {#if offline}
+              last seen {ago(w.last_heartbeat, $now)}
+            {:else}
+              up {fmtUptime(w.registered_at, $now)} · heartbeat {ago(w.last_heartbeat, $now)}
+            {/if}
+          </div>
+          {#if w.tags?.length}
+            <div class="wc-tags">
+              {#each w.tags as t (t)}<span class="wc-tag">{t}</span>{/each}
+            </div>
+          {/if}
 
           {#if offline}
             <div class="wc-well offwell">
