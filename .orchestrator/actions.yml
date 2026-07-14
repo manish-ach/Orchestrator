@@ -34,6 +34,35 @@ jobs:
     artifacts: [release.tar.gz]
     script: tar czf release.tar.gz build-info.txt .orchestrator && ls -lh release.tar.gz
 
+  # Offloaded compilation: the server is too weak to compile Rust, so a
+  # `heavy`-tagged worker (with docker) builds the release binary and the
+  # dashboard for the server's platform and ships them as one artifact.
+  # self-deploy then bakes a runtime-only image from them in seconds.
+  compile-release:
+    stage: package
+    image: docker:28-cli
+    tags: [heavy, docker]
+    artifacts: [prebuilt.tar.gz]
+    env:
+      JOB_TIMEOUT: "3600"
+      # the platform the SERVER runs on — change if it isn't x86_64
+      TARGET_PLATFORM: linux/amd64
+    script: |
+      # non-main pushes don't deploy, so don't burn 10 minutes compiling;
+      # ship an empty bundle to keep the declared artifact satisfied
+      [ "$REPO_BRANCH" = "main" ] || { echo "push was to '$REPO_BRANCH' — skipping release build"; mkdir -p prebuilt && tar czf prebuilt.tar.gz prebuilt; exit 0; }
+      docker build --platform "$TARGET_PLATFORM" --target rust -t orchestrator-xbuild .
+      mkdir -p prebuilt
+      id=$(docker create --platform "$TARGET_PLATFORM" orchestrator-xbuild)
+      docker cp "$id":/build/target/release/orchestrator prebuilt/orchestrator
+      docker rm "$id"
+      docker build --target dashboard -t orchestrator-dashbuild .
+      id=$(docker create orchestrator-dashbuild)
+      docker cp "$id":/build/dist prebuilt/dist
+      docker rm "$id"
+      tar czf prebuilt.tar.gz prebuilt
+      ls -lh prebuilt.tar.gz
+
   # Self-deploy: rebuild the running stack from the pushed commit. Needs the
   # server-side override that mounts the docker socket + the stack checkout
   # into the executor (README: "Self-deploy") — fails with a hint otherwise.
@@ -43,7 +72,7 @@ jobs:
   self-deploy:
     stage: deploy
     image: docker:28-cli
-    needs: [package]
+    needs: [package, compile-release]
     env:
       JOB_TIMEOUT: "3600"
       # must run on the server's own worker — other machines have no
@@ -57,6 +86,17 @@ jobs:
       git -C /host/stack fetch origin "$REPO_BRANCH"
       git -C /host/stack reset --hard "${COMMIT_SHA:-origin/$REPO_BRANCH}"
       chown -R "$(stat -c %u /host/stack/.git):$(stat -c %g /host/stack/.git)" /host/stack
+      # prefer the binary/dashboard compiled by compile-release: bake the
+      # runtime-only image (seconds) instead of compiling Rust here (minutes)
+      tar xzf prebuilt.tar.gz 2>/dev/null || true
+      if [ -x prebuilt/orchestrator ] && [ -d prebuilt/dist ]; then
+        echo "using prebuilt artifacts — building runtime-only image"
+        rm -rf /host/stack/prebuilt
+        cp -R prebuilt /host/stack/prebuilt
+        export ORCHESTRATOR_DOCKERFILE=Dockerfile.prebuilt
+      else
+        echo "no usable prebuilt artifacts — compiling on this machine (slow path)"
+      fi
       docker compose --project-directory /host/stack build
       docker run -d --rm \
         -v /var/run/docker.sock:/var/run/docker.sock \

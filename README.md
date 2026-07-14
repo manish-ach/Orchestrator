@@ -83,6 +83,29 @@ Caveats:
 - without the override, `self-deploy` fails with a hint and the rest of
   the pipeline is unaffected
 
+### Fast deploys on a weak server
+
+Compiling Rust on a small server is the slow part of self-deploy. Two
+mechanisms deal with it:
+
+1. **Docker layer caching** — the Dockerfile compiles dependencies against a
+   dummy `main.rs` in their own layer, so a normal push only rebuilds the
+   crate itself, not axum/sqlx/tokio.
+2. **Offloaded compilation** — the `compile-release` job (`tags: [heavy,
+   docker]`) runs on whatever beefy worker advertises those tags: it builds
+   the linux release binary and the dashboard inside docker
+   (`TARGET_PLATFORM` in actions.yml must match the server's arch) and
+   uploads them as `prebuilt.tar.gz`. `self-deploy` unpacks that and builds
+   the runtime-only `Dockerfile.prebuilt` instead — seconds instead of
+   minutes. If the artifact is missing or empty it falls back to compiling
+   locally, so deploys still work when no heavy worker was around (only
+   slower).
+
+To act as the build machine, a worker needs docker installed and tags:
+
+    cargo run --release -- worker --name laptop --tags heavy,docker \
+      --coordinator https://ci.example.com
+
 ## Workers on other machines
 
 Any machine can join the pool and share CI load — it needs its own

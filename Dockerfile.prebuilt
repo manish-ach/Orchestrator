@@ -1,0 +1,35 @@
+# Runtime-only variant of Dockerfile: no compilers, no npm — the binary and
+# dashboard bundle arrive PREBUILT in the build context, produced by the
+# `compile-release` pipeline job on a `heavy`-tagged worker and unpacked by
+# `self-deploy` (see .orchestrator/actions.yml). Expects:
+#
+#   prebuilt/orchestrator   linux/amd64 release binary
+#   prebuilt/dist/          built dashboard
+#
+# Select it through compose:  ORCHESTRATOR_DOCKERFILE=Dockerfile.prebuilt
+# (docker-compose.yml defaults to the self-building Dockerfile otherwise).
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+# yaml-parser runs via its own uv-managed venv (uv fetches python itself)
+COPY yaml-parser/pyproject.toml yaml-parser/uv.lock yaml-parser/
+COPY yaml-parser/*.py yaml-parser/
+RUN cd yaml-parser && uv sync --no-dev
+
+COPY prebuilt/orchestrator /usr/local/bin/orchestrator
+RUN chmod +x /usr/local/bin/orchestrator
+COPY prebuilt/dist /app/dashboard/dist
+# this repo's own pipeline — the trigger fallback until it's pushed to Forgejo
+COPY .orchestrator .orchestrator
+
+ENV YAML_PARSER_DIR=/app/yaml-parser \
+    YAML_PARSER_PYTHON=/app/yaml-parser/.venv/bin/python \
+    DASHBOARD_DIST=/app/dashboard/dist
+
+EXPOSE 8080
+CMD ["orchestrator", "coordinator", "--port", "8080"]

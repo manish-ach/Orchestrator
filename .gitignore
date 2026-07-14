@@ -8,3 +8,6 @@ command-executor/storage/
 .DS_Store
 .worker-id-*
 artifacts/
+# staged by compile-release/self-deploy — never committed
+prebuilt/
+prebuilt.tar.gz

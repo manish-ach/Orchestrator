@@ -14,8 +14,14 @@ RUN npm run build
 FROM rust:1-bookworm AS rust
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+# compile dependencies against a dummy main in their own layer, so a source
+# change only rebuilds this crate — not axum/sqlx/tokio all over again
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release \
+    && rm -rf src
 COPY src src
-RUN cargo build --release
+# cargo compares mtimes against the dummy build; force the real sources
+RUN touch src/main.rs && cargo build --release
 
 # ---- runtime ----------------------------------------------------------
 FROM debian:bookworm-slim
