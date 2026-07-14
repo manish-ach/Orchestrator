@@ -20,6 +20,8 @@ export interface Job {
   stage: string;
   name: string;
   command: string;
+  /** names of jobs this one depends on — the DAG edges */
+  needs?: string[];
   status: JobStatus;
   worker: string | null;
   started_at: number | null;

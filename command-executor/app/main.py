@@ -1,6 +1,7 @@
 # app/main.py
 
 import asyncio
+import shlex
 from contextlib import asynccontextmanager
 
 import httpx
@@ -69,7 +70,10 @@ async def run_sync(req: RunRequest):
     outputs back. The job is still recorded in SQLite like any /jobs
     submission."""
     ws = None
-    command = req.command
+    # sh -x traces every executed statement as a "+ cmd" line interleaved
+    # with its output — the dashboard splits the log into steps on those
+    # markers (GitHub-Actions-style). Semantics are unchanged.
+    command = f"sh -xc {shlex.quote(req.command)}"
     if req.workspace:
         try:
             ws = await runner.prepare_workspace(req.workspace, req.repo_url, req.commit_sha)
@@ -77,7 +81,7 @@ async def run_sync(req: RunRequest):
                 await runner.fetch_artifacts(url, ws)
         except runner.WorkspaceError as e:
             return {"id": None, "output": str(e), "status": "failed", "exit_code": None}
-        command = f'cd "{ws}" && ({req.command})'
+        command = f'cd "{ws}" && {command}'
 
     job_id = runner.create_job(command, env=req.env, timeout=req.timeout)
     run_task = asyncio.create_task(runner.run_job(job_id))

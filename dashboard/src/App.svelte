@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { authRequired, getToken } from './lib/api';
   import { route } from './lib/router';
+  import History from './pages/History.svelte';
   import Login from './pages/Login.svelte';
   import Monitor from './pages/Monitor.svelte';
   import Overview from './pages/Overview.svelte';
@@ -28,7 +29,9 @@
 {#if auth === 'login'}
   <Login onsuccess={() => (auth = 'ok')} />
 {:else if auth === 'ok'}
-  {#if page === 'repos'}
+  {#if page === 'runs'}
+    <History />
+  {:else if page === 'repos'}
     <Repos />
   {:else if page === 'repo'}
     {#key $route.path[1]}

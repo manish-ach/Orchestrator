@@ -15,7 +15,6 @@
   let overview = $state<Overview | null>(null);
   let calendar = $state<CalendarDay[]>([]);
   let error = $state('');
-  let triggering = $state(false);
 
   const stop = startPolling(async () => {
     try {
@@ -116,28 +115,15 @@
     return `passed in <b>${fmtDur(runDuration(r))}</b>`;
   }
 
-  async function trigger() {
-    triggering = true;
-    try {
-      await api.trigger();
-      overview = await api.overview();
-    } finally {
-      triggering = false;
-    }
-  }
-
   const repoCount = $derived(new Set(runs.map((r) => r.repo ?? r.pipeline)).size);
 </script>
 
-<Topbar active="runs" {overview}>
+<Topbar active="overview" {overview}>
   <div class="wrap">
     <div class="page-head">
       <h1>Overview</h1>
       <span class="meta">
         {repoCount} repos · {runs.length} runs · {runs.filter((r) => r.status === 'passed').length} passed
-      </span>
-      <span class="actions">
-        <button class="btn btn-lime" onclick={trigger} disabled={triggering}>Trigger run</button>
       </span>
     </div>
 
@@ -258,11 +244,14 @@
     </section>
   </div>
 
-  <div class="section-label">Updates <span class="meta">latest pipeline runs — pushes touching a .yml / .yaml file are flagged</span></div>
+  <div class="section-label">
+    Updates <span class="meta">latest pipeline runs — pushes touching a .yml / .yaml file are flagged</span>
+    <a class="seeall" href="#/runs">all runs →</a>
+  </div>
   <section class="feed" aria-label="Updates">
     {#if !feed.length}
       <div class="empty">
-        No runs yet — trigger one manually or push to a registered repo.
+        No runs yet — push to a registered repo and its pipeline appears here.
       </div>
     {/if}
     {#each feed as r (r.id)}

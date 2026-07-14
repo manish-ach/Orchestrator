@@ -5,6 +5,7 @@
   import Snackbar from '../lib/components/Snackbar.svelte';
   import StatusPill from '../lib/components/StatusPill.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
+  import { classify, parseSteps, type LineKind } from '../lib/logsteps';
   import { now, startPolling } from '../lib/poll';
   import type { Job, JobStatus, LogLine, Run, Worker } from '../lib/types';
 
@@ -17,6 +18,7 @@
   let jobSel = $state<number | null>(null);
   let logFollow = $state(true);
   let logWrap = $state(false);
+  let logRaw = $state(false);
   let log = $state<LogLine[]>([]);
   // svelte-ignore state_referenced_locally — the deep link is consumed once, on purpose
   let deepLinkPending = initialJob !== null;
@@ -71,6 +73,11 @@
     return { t0, t1: Math.max(t1, t0 + 1000) };
   }
 
+  function jobDur(j: Job): string {
+    if (!j.started_at) return '';
+    return fmtDur((j.finished_at ?? $now) - j.started_at);
+  }
+
   // ---- overview stats ---------------------------------------------------------
   const passed = $derived(run ? run.jobs.filter((j) => j.status === 'passed').length : 0);
   const failedCount = $derived(run ? run.jobs.filter((j) => j.status === 'failed').length : 0);
@@ -82,6 +89,7 @@
     view = job.stage;
     jobSel = job.id;
     logFollow = true;
+    collapsedSteps = new Set();
   }
   function selectStage(stage: string) {
     view = stage;
@@ -112,6 +120,25 @@
     if (logFollow && logBody) logBody.scrollTop = logBody.scrollHeight;
   });
 
+  // ---- step breakdown ---------------------------------------------------------
+  let collapsedSteps = $state<Set<number>>(new Set());
+  const rawLines = $derived(log.map((l) => l.t));
+  const steps = $derived(parseSteps(rawLines));
+  const hasSteps = $derived(steps.some((s) => s.cmd !== null));
+
+  function toggleStep(i: number) {
+    const next = new Set(collapsedSteps);
+    if (next.has(i)) next.delete(i);
+    else next.add(i);
+    collapsedSteps = next;
+  }
+  function setAllSteps(collapsed: boolean) {
+    collapsedSteps = collapsed ? new Set(steps.map((_, i) => i)) : new Set();
+  }
+  function rawKind(t: string): LineKind | 'cmd' {
+    return /^\++ /.test(t) ? 'cmd' : classify(t);
+  }
+
   // full logs of every job in the selected stage (stage view, no job
   // selected) — refetched on each poll so running jobs tail live
   let stageLogs = $state<Record<number, LogLine[]>>({});
@@ -141,7 +168,7 @@
   }
 
   async function copyLog() {
-    await navigator.clipboard.writeText(log.map((l) => l.t).join('\n'));
+    await navigator.clipboard.writeText(rawLines.join('\n'));
     copied = true;
     setTimeout(() => (copied = false), 1200);
   }
@@ -174,6 +201,76 @@
       cancelled = true;
     };
   });
+
+  // ---- DAG canvas layout --------------------------------------------------------
+  // Real dependency edges from `needs`, not implied stage order: nodes are
+  // laid out on a fixed grid (stage = column) and edges are bezier paths.
+  const NODE_W = 220;
+  const NODE_H = 62;
+  const COL_GAP = 110;
+  const ROW_GAP = 16;
+  const DAG_TOP = 52;
+  const DAG_PAD = 24;
+
+  interface FlowNode {
+    job: Job;
+    x: number;
+    y: number;
+  }
+
+  const flowNodes = $derived.by<FlowNode[]>(() => {
+    if (!run) return [];
+    return stages.flatMap((stage, ci) =>
+      stageJobs(stage).map((j, ri) => ({
+        job: j,
+        x: DAG_PAD + ci * (NODE_W + COL_GAP),
+        y: DAG_TOP + ri * (NODE_H + ROW_GAP),
+      })),
+    );
+  });
+  const dagW = $derived(DAG_PAD * 2 + Math.max(stages.length, 1) * (NODE_W + COL_GAP) - COL_GAP);
+  const dagH = $derived.by(() => {
+    const maxRows = Math.max(1, ...stages.map((s) => stageJobs(s).length));
+    return DAG_TOP + maxRows * (NODE_H + ROW_GAP) - ROW_GAP + DAG_PAD;
+  });
+
+  let hoverJob = $state<string | null>(null);
+
+  interface FlowEdge {
+    from: string;
+    to: string;
+    path: string;
+    status: JobStatus;
+    active: boolean;
+  }
+
+  const flowEdges = $derived.by<FlowEdge[]>(() => {
+    const byName = new Map(flowNodes.map((n) => [n.job.name, n]));
+    const edges: FlowEdge[] = [];
+    for (const n of flowNodes) {
+      for (const dep of n.job.needs ?? []) {
+        const from = byName.get(dep);
+        if (!from) continue;
+        const x1 = from.x + NODE_W;
+        const y1 = from.y + NODE_H / 2;
+        const x2 = n.x;
+        const y2 = n.y + NODE_H / 2;
+        const dx = Math.max(36, (x2 - x1) / 2);
+        edges.push({
+          from: dep,
+          to: n.job.name,
+          path: `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`,
+          status: from.job.status,
+          active: n.job.status === 'running',
+        });
+      }
+    }
+    return edges;
+  });
+
+  function edgeHl(e: FlowEdge): boolean {
+    return hoverJob !== null && (e.from === hoverJob || e.to === hoverJob);
+  }
 
   // ---- pan / zoom canvas ------------------------------------------------------
   let pan = $state({ x: 0, y: 0 });
@@ -257,6 +354,13 @@
   }
 </script>
 
+{#snippet logline(text: string, n: number, kind: LineKind | 'cmd')}
+  <div class="lnrow" class:err={kind === 'err'} class:warn={kind === 'warn'} class:ok={kind === 'ok'} class:meta={kind === 'meta'} class:cmd={kind === 'cmd'}>
+    <span class="lnum" aria-hidden="true">{n}</span>
+    <span class="ltxt">{text || ' '}</span>
+  </div>
+{/snippet}
+
 <Snackbar fallback="/">
   {#if run}
     <StatusPill status={run.status} />
@@ -290,6 +394,7 @@
       >
         <span class="g {stageStatus(jobs)}" aria-hidden="true">{GLYPH[stageStatus(jobs)]}</span>
         <span class="nname">{stage}</span>
+        <span class="ndur">{jobs.filter((j) => j.status === 'passed').length}/{jobs.length}</span>
       </button>
       {#each jobs as j (j.id)}
         <button
@@ -301,7 +406,7 @@
         >
           <span class="g {j.status}" aria-hidden="true">{GLYPH[j.status]}</span>
           <span class="ncol">
-            <span class="nname">{j.name}</span>
+            <span class="nname">{j.name}{#if jobDur(j)}<span class="ndur"> · {jobDur(j)}</span>{/if}</span>
             <span class="ncmd">$ {j.command}</span>
           </span>
         </button>
@@ -375,39 +480,49 @@
             onwheel={onWheel}
           >
             <div class="flow-stage" style="transform: translate({pan.x}px, {pan.y}px) scale({scale})">
-              <div class="flow">
-                {#each stages as stage, i (stage)}
+              <div class="dag" style="width:{dagW}px;height:{dagH}px">
+                <svg class="dag-svg" width={dagW} height={dagH} aria-hidden="true">
+                  {#each flowEdges as e (e.from + '→' + e.to)}
+                    <path
+                      class="dag-edge {e.status}"
+                      class:activeflow={e.active}
+                      class:hl={edgeHl(e)}
+                      class:dim={hoverJob !== null && !edgeHl(e)}
+                      d={e.path}
+                    />
+                  {/each}
+                </svg>
+                {#each stages as stage, ci (stage)}
                   {@const jobs = stageJobs(stage)}
-                  {#if i > 0}<div class="fconn" aria-hidden="true"></div>{/if}
-                  <div class="fcol-wrap">
-                    <span class="fstage-row">
-                      <span class="fstage-label">{stage}</span>
-                      <span class="fst-ico {stageStatus(jobs)}" aria-label={stageStatus(jobs)}>{GLYPH[stageStatus(jobs)]}</span>
+                  <span class="fstage-row dag-label" style="left:{DAG_PAD + ci * (NODE_W + COL_GAP)}px; width:{NODE_W}px">
+                    <span class="fstage-label">{stage}</span>
+                    <span class="fst-ico {stageStatus(jobs)}" aria-label={stageStatus(jobs)}>{GLYPH[stageStatus(jobs)]}</span>
+                  </span>
+                {/each}
+                {#each flowNodes as n (n.job.id)}
+                  <button
+                    type="button"
+                    class="fnode dag-node"
+                    class:is-failed={n.job.status === 'failed'}
+                    class:is-pending={n.job.status === 'pending'}
+                    class:dimmed={hoverJob !== null && hoverJob !== n.job.name && !flowEdges.some((e) => edgeHl(e) && (e.from === n.job.name || e.to === n.job.name))}
+                    style="left:{n.x}px; top:{n.y}px; width:{NODE_W}px; height:{NODE_H}px"
+                    onclick={() => selectJob(n.job)}
+                    onmouseenter={() => (hoverJob = n.job.name)}
+                    onmouseleave={() => (hoverJob = null)}
+                  >
+                    <span class="fcircle {n.job.status}" aria-hidden="true">{n.job.status === 'pending' ? '' : GLYPH[n.job.status]}</span>
+                    <span class="fbody">
+                      <span class="fname2">{n.job.name}</span>
+                      {#if n.job.status === 'failed'}
+                        <span class="fsub bad">failed at {fmtDur((n.job.finished_at ?? $now) - (n.job.started_at ?? $now))}</span>
+                      {:else if n.job.status === 'pending'}
+                        <span class="fsub">{n.job.needs?.length ? `waiting on ${n.job.needs.join(', ')}` : 'queued'}</span>
+                      {:else if n.job.started_at}
+                        <span class="fsub">{fmtDur((n.job.finished_at ?? $now) - n.job.started_at)}{#if n.job.worker} · {n.job.worker}{/if}</span>
+                      {/if}
                     </span>
-                    <div class="fcol">
-                      {#each jobs as j (j.id)}
-                        <button
-                          type="button"
-                          class="fnode"
-                          class:is-failed={j.status === 'failed'}
-                          class:is-pending={j.status === 'pending'}
-                          onclick={() => selectJob(j)}
-                        >
-                          <span class="fcircle {j.status}" aria-hidden="true">{j.status === 'pending' ? '' : GLYPH[j.status]}</span>
-                          <span class="fbody">
-                            <span class="fname2">{j.name}</span>
-                            {#if j.status === 'failed'}
-                              <span class="fsub bad">failed at {fmtDur((j.finished_at ?? $now) - (j.started_at ?? $now))}</span>
-                            {:else if j.status === 'pending'}
-                              <span class="fsub">pending</span>
-                            {:else if j.started_at}
-                              <span class="fsub">{fmtDur((j.finished_at ?? $now) - j.started_at)}</span>
-                            {/if}
-                          </span>
-                        </button>
-                      {/each}
-                    </div>
-                  </div>
+                  </button>
                 {/each}
               </div>
             </div>
@@ -444,56 +559,109 @@
         {@const win = stageWindow(jobs)}
         {@const stWorkers = [...new Set(jobs.filter((j) => j.worker).map((j) => j.worker!))]}
         {@const failedJob = jobs.find((j) => j.status === 'failed')}
-        <div class="stage-row">
-          <div>
-            {#if selJob}
-              <div class="section-label">Command log
-                <span class="meta">{view} / {selJob.name}</span>
-              </div>
-              <div class="log-controls">
-                <button type="button" class="toggle" aria-pressed={logFollow}
-                  onclick={() => { logFollow = !logFollow; if (logFollow && logBody) logBody.scrollTop = logBody.scrollHeight; }}>
-                  follow tail
-                </button>
-                <button type="button" class="toggle" aria-pressed={logWrap} onclick={() => (logWrap = !logWrap)}>wrap lines</button>
-                <span class="spacer"></span>
-                <button type="button" class="btn" onclick={copyLog}>{copied ? 'Copied' : 'Copy log'}</button>
-              </div>
-              <div class="term" class:failed={selJob.status === 'failed'}>
+        {#if selJob}
+          <div class="job-shell">
+            <div class="job-main">
+              <div class="term term-xl" class:failed={selJob.status === 'failed'}>
                 <div class="term-head">
                   <span class="dot" aria-hidden="true"></span>{selJob.worker ?? 'unassigned'}
                   <span class="tjob" title={selJob.name}>{selJob.status === 'failed' ? `${GLYPH.failed} ` : ''}{selJob.name}</span>
+                  <span class="term-tools">
+                    {#if hasSteps}
+                      <button type="button" class="ttool" aria-pressed={!logRaw} onclick={() => (logRaw = !logRaw)}>
+                        {logRaw ? 'raw' : 'steps'}
+                      </button>
+                      {#if !logRaw}
+                        <button type="button" class="ttool" onclick={() => setAllSteps(collapsedSteps.size === 0)}>
+                          {collapsedSteps.size === 0 ? 'collapse all' : 'expand all'}
+                        </button>
+                      {/if}
+                    {/if}
+                    <button type="button" class="ttool" aria-pressed={logFollow}
+                      onclick={() => { logFollow = !logFollow; if (logFollow && logBody) logBody.scrollTop = logBody.scrollHeight; }}>
+                      follow
+                    </button>
+                    <button type="button" class="ttool" aria-pressed={logWrap} onclick={() => (logWrap = !logWrap)}>wrap</button>
+                    <button type="button" class="ttool" onclick={copyLog}>{copied ? 'copied ✓' : 'copy'}</button>
+                  </span>
                 </div>
                 <div
-                  class="term-body full"
+                  class="term-body full xl"
                   class:wrapped={logWrap}
                   bind:this={logBody}
                   onscroll={onLogScroll}
                   role="log"
                   aria-label="Log for {selJob.name}"
                 >
-                  {#each log as l, i (i)}
-                    <div class="lnrow" class:err={l.err} class:ok={l.ok}>
-                      <span class="lnum" aria-hidden="true">{i + 1}</span>
-                      <span class="ltxt">{l.t || ' '}</span>
-                    </div>
-                  {:else}
+                  {#if !log.length}
                     <div class="lnrow">
                       <span class="lnum" aria-hidden="true"></span>
                       <span class="ltxt" style="color:var(--term-muted)">queued — no output yet</span>
                     </div>
-                  {/each}
+                  {:else if hasSteps && !logRaw}
+                    {#each steps as s, si (si)}
+                      <div class="step" class:stepfail={selJob.status === 'failed' && si === steps.length - 1}>
+                        <button type="button" class="step-head" aria-expanded={!collapsedSteps.has(si)} onclick={() => toggleStep(si)}>
+                          <span class="chev" aria-hidden="true">{collapsedSteps.has(si) ? '▸' : '▾'}</span>
+                          <span class="step-ix">{si + 1}</span>
+                          <span class="step-cmd">{s.cmd ?? 'setup'}</span>
+                          <span class="step-meta">{s.lines.length} line{s.lines.length === 1 ? '' : 's'}</span>
+                        </button>
+                        {#if !collapsedSteps.has(si)}
+                          {#each s.lines as l, i (i)}
+                            {@render logline(l, s.start + i, classify(l))}
+                          {/each}
+                        {/if}
+                      </div>
+                    {/each}
+                  {:else}
+                    {#each rawLines as l, i (i)}
+                      {@render logline(l, i + 1, rawKind(l))}
+                    {/each}
+                  {/if}
                 </div>
                 <div class="term-foot">
                   <span class="tcmd" title="$ {selJob.command}">$ {selJob.command}</span>
                   {#if selJob.status === 'running'}
                     <span class="tlines streaming">streaming…</span>
                   {:else}
-                    <span class="tlines">{log.length} lines</span>
+                    <span class="tlines">{rawLines.length} lines{#if selJob.exit_code !== null} · exit {selJob.exit_code}{/if}</span>
                   {/if}
                 </div>
               </div>
-            {:else}
+            </div>
+
+            <aside class="card stage-info" aria-label="Job details">
+              <div class="si-head"><span class="sname">{selJob.name}</span><StatusPill status={selJob.status} /></div>
+              <div class="sirow"><span class="sik">stage</span><span class="siv">{selJob.stage}</span></div>
+              <div class="sirow"><span class="sik">worker</span><span class="siv">{selJob.worker ?? 'unassigned'}</span></div>
+              <div class="sirow"><span class="sik">duration</span><span class="siv">{jobDur(selJob) || '—'}</span></div>
+              <div class="sirow">
+                <span class="sik">started</span>
+                <span class="siv">{selJob.started_at ? `+${fmtDur(selJob.started_at - run.started_at)} into the run` : 'not started'}</span>
+              </div>
+              {#if selJob.exit_code !== null}
+                <div class="sirow"><span class="sik">exit code</span><span class="siv" class:bad={selJob.exit_code !== 0}>{selJob.exit_code}</span></div>
+              {/if}
+              {#if selJob.needs?.length}
+                <div class="sirow"><span class="sik">needs</span><span class="siv">{selJob.needs.join(', ')}</span></div>
+              {/if}
+              {#if selJob.tags?.length}
+                <div class="sirow"><span class="sik">worker tags</span><span class="siv">{selJob.tags.join(', ')}</span></div>
+              {/if}
+              {#if selJob.artifacts?.length}
+                <div class="sirow">
+                  <span class="sik">artifacts</span>
+                  <span class="siv">{selJob.artifacts.join(', ')}{selJob.has_artifacts ? ' · uploaded ✓' : ''}</span>
+                </div>
+              {/if}
+              <div class="sirow"><span class="sik">command</span><pre class="si-cmd">{selJob.command}</pre></div>
+              <button type="button" class="siv-link si-back" onclick={() => selectStage(selJob.stage)}>← all of {selJob.stage}</button>
+            </aside>
+          </div>
+        {:else}
+          <div class="stage-row">
+            <div>
               <div class="section-label">Worker utilization <span class="meta">within this stage's window</span></div>
               {#if !win || !stWorkers.length}
                 <div class="empty">This stage has not started yet.</div>
@@ -527,10 +695,7 @@
                   </div>
                   <div class="term-body full stage-log" role="log" aria-label="Log for {j.name}">
                     {#each jlog as l, i (i)}
-                      <div class="lnrow" class:err={l.err} class:ok={l.ok}>
-                        <span class="lnum" aria-hidden="true">{i + 1}</span>
-                        <span class="ltxt">{l.t || ' '}</span>
-                      </div>
+                      {@render logline(l.t, i + 1, rawKind(l.t))}
                     {:else}
                       <div class="lnrow">
                         <span class="lnum" aria-hidden="true"></span>
@@ -550,27 +715,27 @@
                   </div>
                 </div>
               {/each}
-            {/if}
-          </div>
+            </div>
 
-          <aside class="card stage-info" aria-label="Stage details">
-            <div class="si-head"><span class="sname">{view}</span><StatusPill status={stageStatus(jobs)} /></div>
-            <div class="sirow"><span class="sik">jobs</span><span class="siv">{jobs.filter((j) => j.status === 'passed').length}/{jobs.length} passed</span></div>
-            <div class="sirow"><span class="sik">duration</span><span class="siv">{win ? fmtDur(win.t1 - win.t0) : '—'}</span></div>
-            <div class="sirow"><span class="sik">starts at</span><span class="siv">{win ? `+${fmtDur(win.t0 - run.started_at)} into the run` : 'not started'}</span></div>
-            <div class="sirow"><span class="sik">workers</span><span class="siv">{stWorkers.length ? stWorkers.join(', ') : '—'}</span></div>
-            {#if failedJob}
-              <div class="sirow">
-                <span class="sik">failed at</span>
-                <span class="siv">
-                  <button type="button" class="siv-link" onclick={() => selectJob(failedJob)}>
-                    {failedJob.name} · exit {failedJob.exit_code}
-                  </button>
-                </span>
-              </div>
-            {/if}
-          </aside>
-        </div>
+            <aside class="card stage-info" aria-label="Stage details">
+              <div class="si-head"><span class="sname">{view}</span><StatusPill status={stageStatus(jobs)} /></div>
+              <div class="sirow"><span class="sik">jobs</span><span class="siv">{jobs.filter((j) => j.status === 'passed').length}/{jobs.length} passed</span></div>
+              <div class="sirow"><span class="sik">duration</span><span class="siv">{win ? fmtDur(win.t1 - win.t0) : '—'}</span></div>
+              <div class="sirow"><span class="sik">starts at</span><span class="siv">{win ? `+${fmtDur(win.t0 - run.started_at)} into the run` : 'not started'}</span></div>
+              <div class="sirow"><span class="sik">workers</span><span class="siv">{stWorkers.length ? stWorkers.join(', ') : '—'}</span></div>
+              {#if failedJob}
+                <div class="sirow">
+                  <span class="sik">failed at</span>
+                  <span class="siv">
+                    <button type="button" class="siv-link" onclick={() => selectJob(failedJob)}>
+                      {failedJob.name} · exit {failedJob.exit_code}
+                    </button>
+                  </span>
+                </div>
+              {/if}
+            </aside>
+          </div>
+        {/if}
       {/if}
 
       <footer class="foot">

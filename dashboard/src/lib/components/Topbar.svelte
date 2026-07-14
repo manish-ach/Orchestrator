@@ -40,7 +40,8 @@
       </span>
     </div>
     <nav class="wrap topnav" aria-label="Pages">
-      <a href="#/" aria-current={active === 'runs' ? 'page' : undefined}>runs</a>
+      <a href="#/" aria-current={active === 'overview' ? 'page' : undefined}>overview</a>
+      <a href="#/runs" aria-current={active === 'runs' ? 'page' : undefined}>runs</a>
       <a href="#/repos" aria-current={active === 'repos' ? 'page' : undefined}>repos</a>
       <a href="#/monitor" aria-current={active === 'monitor' ? 'page' : undefined}>monitor</a>
     </nav>
