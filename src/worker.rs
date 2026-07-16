@@ -143,6 +143,7 @@ async fn run_job(client: &Client, claimed: &ClaimedJob) {
         inputs,
         outputs: job.artifacts.clone(),
         upload_url,
+        progress_url: Some(format!("{}/api/jobs/{}/progress", coordinator_url(), job.id)),
     };
 
     let response = client

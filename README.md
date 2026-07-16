@@ -83,6 +83,25 @@ Caveats:
 - without the override, `self-deploy` fails with a hint and the rest of
   the pipeline is unaffected
 
+## Workers on other machines
+
+Any machine can join the pool and share CI load — it needs its own
+executor plus a worker pointed at the coordinator:
+
+    cd command-executor && uv sync && uv run uvicorn app.main:app --port 9000
+    COORDINATOR_URL=https://ci.example.com cargo run --release -- worker --name macbook
+
+Jobs claimed by that worker run as plain subprocesses on that machine, in a
+workspace cloned from the pushed commit; artifacts still travel through the
+coordinator, so `needs` works across machines.
+
+Machine-specific jobs (like `self-deploy`, which needs the server's docker
+socket) declare `env: WORKER_PIN: <worker name>` in actions.yml — they are
+queued only for that worker while it's online. Everything else lands in the
+global queue, first free worker wins. Note the API is unauthenticated:
+anyone who can reach the coordinator URL can register a worker and claim
+jobs.
+
 ## Pieces
 
 | Directory           | What                                                      |

@@ -184,6 +184,17 @@ impl Store {
             .count() as u16)
     }
 
+    /// Resolve a worker NAME (the stable label from `--name`) to the id of
+    /// an online worker carrying it — how WORKER_PIN finds its queue.
+    async fn find_worker_by_name(&self, name: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .list_workers()
+            .await?
+            .into_iter()
+            .find(|w| w.name == name && matches!(w.status, Status::Online))
+            .map(|w| w.id))
+    }
+
     async fn worker_fresh(&self, id: &str, within_ms: i64) -> Result<bool, String> {
         Ok(self
             .get_worker(id)
@@ -257,7 +268,7 @@ impl Store {
     /// worker that ran them (files are probably warm there); independent
     /// jobs go to the global queue for any free worker.
     async fn enqueue_ready(&self, run_id: i64) -> Result<(), String> {
-        let rows = sqlx::query("SELECT id, needs FROM jobs WHERE run_id = $1 AND status = 'pending' AND queued = FALSE ORDER BY id")
+        let rows = sqlx::query("SELECT id, needs, env FROM jobs WHERE run_id = $1 AND status = 'pending' AND queued = FALSE ORDER BY id")
             .bind(run_id)
             .fetch_all(&self.db)
             .await
@@ -283,17 +294,31 @@ impl Store {
                 continue;
             }
 
-            // prefer the worker that produced the most dependencies
-            let mut votes: HashMap<&str, usize> = HashMap::new();
-            for n in &needs {
-                if let Some(Some(wid)) = passed.get(n) {
-                    *votes.entry(wid.as_str()).or_default() += 1;
+            // a hard pin from the pipeline (env WORKER_PIN: <worker name>)
+            // beats the warm-files heuristic — jobs like self-deploy only
+            // make sense on one specific machine
+            let mut target: Option<String> = None;
+            let env: HashMap<String, String> =
+                serde_json::from_value(row.get::<serde_json::Value, _>("env")).unwrap_or_default();
+            if let Some(pin) = env.get("WORKER_PIN") {
+                target = self.find_worker_by_name(pin).await?;
+                if target.is_none() {
+                    println!("Job {id}: WORKER_PIN '{pin}' matches no online worker — any worker may claim it");
                 }
             }
-            let mut target: Option<String> = None;
-            if let Some((wid, _)) = votes.into_iter().max_by_key(|(_, c)| *c) {
-                if self.worker_fresh(wid, HEARTBEAT_TIMEOUT_MS).await? {
-                    target = Some(wid.to_string());
+
+            // otherwise prefer the worker that produced the most dependencies
+            if target.is_none() {
+                let mut votes: HashMap<&str, usize> = HashMap::new();
+                for n in &needs {
+                    if let Some(Some(wid)) = passed.get(n) {
+                        *votes.entry(wid.as_str()).or_default() += 1;
+                    }
+                }
+                if let Some((wid, _)) = votes.into_iter().max_by_key(|(_, c)| *c) {
+                    if self.worker_fresh(wid, HEARTBEAT_TIMEOUT_MS).await? {
+                        target = Some(wid.to_string());
+                    }
                 }
             }
 
@@ -602,6 +627,19 @@ impl Store {
             .await
             .map_err(|e| e.to_string())?;
         Ok(rows.iter().map(job_from_row).collect())
+    }
+
+    /// Live tail pushed by the executor while a job runs — lets the
+    /// dashboard stream logs before the final report lands. Only running
+    /// jobs accept progress so a late POST can't clobber the real output.
+    pub async fn job_progress(&self, job_id: i64, output: &str) -> Result<(), String> {
+        sqlx::query("UPDATE jobs SET output = $2 WHERE id = $1 AND status = 'running'")
+            .bind(job_id)
+            .bind(output)
+            .execute(&self.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub async fn job_output(&self, job_id: i64) -> Result<Option<String>, String> {
