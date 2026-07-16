@@ -45,6 +45,44 @@ Worker configuration: `COORDINATOR_URL` and `EXECUTOR_URL` env vars
 Every push then creates a run (trigger `webhook`, with commit sha/message/
 author) that the dashboard picks up on its next poll.
 
+## Self-deploy (the orchestrator ships itself)
+
+With this enabled, a push to `main` rebuilds and redeploys the running
+stack through its own pipeline — the `self-deploy` job in
+`.orchestrator/actions.yml`. The job syncs the server's checkout to the
+pushed commit, builds the images there (so the server's
+`docker-compose.override.yml` and `.env` still apply), then hands the final
+`docker compose up -d` to a small detached helper container. The swap
+happens ~10s *after* the run finishes, so the pipeline never kills itself
+mid-run; if the build fails, the run goes red and the old stack keeps
+running.
+
+Enable it on the server with a `docker-compose.override.yml` next to the
+checkout (adjust `/home/ubuntu/Orchestrator` to your path), then
+`docker compose up -d --build` once by hand so the executor gains the
+docker CLI:
+
+    services:
+      executor:
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - /home/ubuntu/Orchestrator:/host/stack
+        environment:
+          HOST_STACK_DIR: /home/ubuntu/Orchestrator
+
+Caveats:
+
+- the checkout's `origin` must be fetchable from inside a container —
+  a public https remote works; an ssh remote using the server user's key
+  does not (`git remote set-url origin https://...` if needed)
+- deploy runs `git reset --hard` to the pushed commit in that checkout;
+  local commits there are discarded (untracked files like the override
+  and `.env` survive)
+- mounting the docker socket gives every pipeline job on this executor
+  control of the host's docker — only register repos you trust
+- without the override, `self-deploy` fails with a hint and the rest of
+  the pipeline is unaffected
+
 ## Pieces
 
 | Directory           | What                                                      |

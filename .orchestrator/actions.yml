@@ -11,6 +11,7 @@ stages:
   - build
   - test
   - package
+  - deploy
 jobs:
   build-info:
     stage: build
@@ -27,3 +28,30 @@ jobs:
     needs: [build-info, validate-pipeline]
     artifacts: [release.tar.gz]
     script: tar czf release.tar.gz build-info.txt .orchestrator && ls -lh release.tar.gz
+
+  # Self-deploy: rebuild the running stack from the pushed commit. Needs the
+  # server-side override that mounts the docker socket + the stack checkout
+  # into the executor (README: "Self-deploy") — fails with a hint otherwise.
+  # Images build inside this job (logs land in the dashboard); the final
+  # `up -d` is handed to a detached helper container so the swap happens
+  # right AFTER this run finishes instead of killing it mid-flight.
+  self-deploy:
+    stage: deploy
+    image: docker:28-cli
+    needs: [package]
+    env:
+      JOB_TIMEOUT: "3600"
+    script: |
+      [ "$REPO_BRANCH" = "main" ] || { echo "push was to '$REPO_BRANCH' — only main deploys"; exit 0; }
+      [ -n "$HOST_STACK_DIR" ] || { echo "HOST_STACK_DIR is not set on the executor — self-deploy is not enabled on this server (README: Self-deploy)"; exit 1; }
+      [ -S /var/run/docker.sock ] || { echo "docker socket is not mounted into the executor (README: Self-deploy)"; exit 1; }
+      git config --global --add safe.directory /host/stack
+      git -C /host/stack fetch origin "$REPO_BRANCH"
+      git -C /host/stack reset --hard "${COMMIT_SHA:-origin/$REPO_BRANCH}"
+      chown -R "$(stat -c %u /host/stack/.git):$(stat -c %g /host/stack/.git)" /host/stack
+      docker compose --project-directory /host/stack build
+      docker run -d --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "$HOST_STACK_DIR":/host/stack \
+        docker:28-cli sh -c 'sleep 10 && docker compose --project-directory /host/stack up -d --no-build'
+      echo "images built — the stack swaps to the new version ~10s after this run completes"

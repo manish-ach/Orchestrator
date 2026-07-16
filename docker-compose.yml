@@ -12,6 +12,10 @@
 #
 # For native dev, `docker compose up -d postgres redis` still works alone.
 
+# Fixed project name so the self-deploy job (which runs compose from another
+# directory) manages THIS stack — same containers, images, and volumes.
+name: orchestrator
+
 services:
   coordinator:
     build: .

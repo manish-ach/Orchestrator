@@ -124,9 +124,18 @@ async fn run_job(client: &Client, claimed: &ClaimedJob) {
     let upload_url = (!job.artifacts.is_empty())
         .then(|| format!("{}/api/jobs/{}/artifacts", coordinator_url(), job.id));
 
+    // jobs default to 5 minutes; long ones (e.g. the self-deploy docker
+    // build) raise it via env JOB_TIMEOUT — the executor caps at its
+    // MAX_TIMEOUT either way
+    let timeout = job
+        .env
+        .get("JOB_TIMEOUT")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(300);
+
     let request = RunRequest {
         command: job.command.clone(),
-        timeout: 300,
+        timeout,
         env: job.env.clone(),
         workspace,
         repo_url: job.env.get("REPO_URL").cloned(),
