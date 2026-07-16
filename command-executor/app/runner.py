@@ -122,7 +122,8 @@ def read_logs(job_id: str) -> str | None:
     if not job or not job["stdout_path"]:
         return None
     try:
-        return Path(job["stdout_path"]).read_text()
+        # errors=replace: a live tail can end mid multi-byte character
+        return Path(job["stdout_path"]).read_text(errors="replace")
     except FileNotFoundError:
         return ""
 
@@ -137,7 +138,11 @@ def cancel_job(job_id: str) -> bool:
 
 
 async def run_job(job_id: str) -> str:
-    """Execute a pending job to completion; returns the final status."""
+    """Execute a pending job to completion; returns the final status.
+
+    Output streams to the log file AS IT ARRIVES, so read_logs() (and the
+    coordinator's progress polling) can tail a running job live instead of
+    waiting for it to finish."""
     job = get_job(job_id)
     if job is None:
         return "failed"
@@ -156,22 +161,32 @@ async def run_job(job_id: str) -> str:
             (proc.pid, _now_ms(), job_id),
         )
 
-    output = b""
+    log_path = Path(job["stdout_path"])
+    log_path.write_bytes(b"")  # exists (and empty) from the first moment
+
+    async def pump() -> None:
+        with log_path.open("ab") as f:
+            while chunk := await proc.stdout.read(4096):
+                f.write(chunk)
+                f.flush()
+
+    pump_task = asyncio.create_task(pump())
     try:
-        output, _ = await asyncio.wait_for(proc.communicate(), timeout=job["timeout"])
+        await asyncio.wait_for(proc.wait(), timeout=job["timeout"])
         status = "passed" if proc.returncode == 0 else "failed"
     except asyncio.TimeoutError:
         proc.kill()
-        output, _ = await proc.communicate()
+        await proc.wait()
         status = "timeout"
     finally:
+        # the pipe closes once the process is dead, so this always ends
+        await pump_task
         RUNNING.pop(job_id, None)
 
     if job_id in CANCELLED:
         CANCELLED.discard(job_id)
         status = "cancelled"
 
-    Path(job["stdout_path"]).write_bytes(output or b"")
     with get_db() as conn:
         conn.execute(
             "UPDATE jobs SET status = ?, exit_code = ?, finished_at = ? WHERE id = ?",
