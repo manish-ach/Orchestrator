@@ -1,21 +1,22 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import { api, MODE } from '../lib/api';
-  import { drawUtilChart, utilizationSeries } from '../lib/charts';
-  import Snackbar from '../lib/components/Snackbar.svelte';
+  import DeviceMonitor from '../lib/components/DeviceMonitor.svelte';
   import StatusPill from '../lib/components/StatusPill.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
   import { classify, parseSteps, type LineKind } from '../lib/logsteps';
   import { highlightYaml } from '../lib/yamlhl';
   import { now, startPolling } from '../lib/poll';
-  import type { Job, JobStatus, LogLine, Run, Worker } from '../lib/types';
+  import { back } from '../lib/router';
+  import type { Job, JobStatus, LogLine, Run, Worker, WorkerStatsSeries } from '../lib/types';
 
   let { id, initialJob = null }: { id: string; initialJob?: string | null } = $props();
 
   let run = $state<Run | null>(null);
   let workers = $state<Worker[]>([]);
+  let statSeries = $state<WorkerStatsSeries[]>([]);
   let error = $state('');
-  let view = $state<string>('overview');
+  let view = $state<string>('summary');
   let jobSel = $state<number | null>(null);
   let logFollow = $state(true);
   let logWrap = $state(false);
@@ -28,9 +29,10 @@
 
   const stop = startPolling(async () => {
     try {
-      const [r, o] = await Promise.all([api.run(id), api.overview()]);
+      const [r, o, s] = await Promise.all([api.run(id), api.overview(), api.workerStats()]);
       run = r;
       workers = o.workers;
+      statSeries = s;
       error = '';
       if (r && deepLinkPending) {
         deepLinkPending = false;
@@ -51,7 +53,6 @@
   }
 
   const stages = $derived(run ? [...new Set(run.jobs.map((j) => j.stage))] : []);
-  const workerStatus = $derived(new Map(workers.map((w) => [w.name, w.status])));
 
   function stageJobs(stage: string): Job[] {
     return run ? run.jobs.filter((j) => j.stage === stage) : [];
@@ -79,11 +80,31 @@
     return fmtDur((j.finished_at ?? $now) - j.started_at);
   }
 
-  // ---- overview stats ---------------------------------------------------------
+  // ---- summary stats ----------------------------------------------------------
   const passed = $derived(run ? run.jobs.filter((j) => j.status === 'passed').length : 0);
   const failedCount = $derived(run ? run.jobs.filter((j) => j.status === 'failed').length : 0);
   const pending = $derived(run ? run.jobs.filter((j) => j.status === 'pending').length : 0);
+  const failedJobs = $derived(run ? run.jobs.filter((j) => j.status === 'failed') : []);
+  const artifactCount = $derived(run ? run.jobs.filter((j) => j.has_artifacts).length : 0);
   const runWorkers = $derived(run ? [...new Set(run.jobs.filter((j) => j.worker).map((j) => j.worker!))] : []);
+
+  const STATUS_TEXT: Record<JobStatus, string> = {
+    passed: 'Success',
+    failed: 'Failure',
+    running: 'In progress',
+    pending: 'Queued',
+  };
+
+  function jobStatusLine(j: Job): string {
+    if (j.status === 'passed') return `succeeded ${ago(j.finished_at, $now)} in ${jobDur(j)}`;
+    if (j.status === 'failed') {
+      return j.started_at
+        ? `failed ${ago(j.finished_at, $now)} in ${jobDur(j)}`
+        : 'skipped — a dependency failed';
+    }
+    if (j.status === 'running') return `running for ${jobDur(j)}`;
+    return 'queued — waiting for a worker';
+  }
 
   // ---- job selection + log ----------------------------------------------------
   function selectJob(job: Job) {
@@ -146,7 +167,7 @@
   $effect(() => {
     const r = run;
     const stage = view;
-    if (!r || stage === 'overview' || jobSel !== null) {
+    if (!r || stage === 'summary' || stage === 'yaml' || jobSel !== null) {
       stageLogs = {};
       return;
     }
@@ -317,42 +338,6 @@
     if (!canvasEl) return;
     setScale(scale * factor, canvasEl.clientWidth / 2, canvasEl.clientHeight / 2);
   }
-
-  // ---- utilization chart action ------------------------------------------------
-  interface UtilParams {
-    values: number[];
-    totalLabel: string;
-    midLabel: string;
-  }
-  function utilChart(canvas: HTMLCanvasElement, params: UtilParams) {
-    drawUtilChart(canvas, params.values, params);
-    return {
-      update(next: UtilParams) {
-        drawUtilChart(canvas, next.values, next);
-      },
-    };
-  }
-
-  function workerUtilParams(name: string, jobs: Job[], t0: number, t1: number): UtilParams {
-    const mine = jobs.filter((j) => j.worker === name);
-    return {
-      values: utilizationSeries(mine, t0, t1),
-      totalLabel: fmtDur(Math.max(t1 - t0, 1000)),
-      midLabel: fmtDur(Math.max(t1 - t0, 1000) / 2),
-    };
-  }
-
-  function busyPct(name: string, jobs: Job[], t0: number, t1: number): number {
-    const total = Math.max(t1 - t0, 1000);
-    const busy = jobs
-      .filter((j) => j.worker === name && j.started_at)
-      .reduce((s, j) => s + (Math.min(j.finished_at ?? t1, t1) - j.started_at!), 0);
-    return Math.min(100, Math.round((busy / total) * 100));
-  }
-
-  function jobsOf(name: string, jobs: Job[]): number {
-    return jobs.filter((j) => j.worker === name && j.started_at).length;
-  }
 </script>
 
 {#snippet logline(text: string, n: number, kind: LineKind | 'cmd')}
@@ -362,33 +347,33 @@
   </div>
 {/snippet}
 
-<Snackbar fallback="/">
-  {#if run}
-    <StatusPill status={run.status} />
-    <span class="stitle" title={run.commit?.message ?? ''}>{run.commit?.message ?? `Run #${run.id}`}</span>
-    <span class="smeta">
-      {run.pipeline} #{run.id}
-      {#if run.commit}<span aria-hidden="true">·</span> <span class="sha-chip">{run.commit.sha}</span>
-        <span aria-hidden="true">·</span> by {run.commit.author}{/if}
-      <span aria-hidden="true">·</span> via {run.trigger}
-      <span aria-hidden="true">·</span> {ago(run.started_at, $now)}
-      <span aria-hidden="true">·</span> {fmtDur(runEnd(run) - run.started_at)}
-    </span>
-  {:else}
-    <span class="stitle">Run #{id}</span>
-  {/if}
-</Snackbar>
+<header class="run-top">
+  <div class="run-top-inner">
+    {#if run}
+      <button type="button" class="run-crumb" onclick={() => back(run?.repo ? `/repo/${run.repo}` : '/')}>
+        ← {run.pipeline}
+      </button>
+      <div class="run-title-row">
+        <span class="ghst {run.status}" aria-label={STATUS_TEXT[run.status]}>{GLYPH[run.status]}</span>
+        <h1 class="run-title" title={run.commit?.message ?? ''}>
+          {run.commit?.message ?? `Run #${run.id}`}
+          <span class="rnum">#{run.id}</span>
+        </h1>
+        <span class="run-top-side mono">{MODE} · polling 3s</span>
+      </div>
+    {:else}
+      <button type="button" class="run-crumb" onclick={() => back('/')}>← runs</button>
+      <div class="run-title-row"><h1 class="run-title">Run #{id}</h1></div>
+    {/if}
+  </div>
+</header>
 
 <div class="run-shell">
   <nav class="side-nav" aria-label="Run sections">
-    <button type="button" class="snav-item" class:active={view === 'overview'} onclick={() => (view = 'overview')}>
-      <span class="g" aria-hidden="true">◈</span><span class="nname">Overview</span>
+    <button type="button" class="snav-item" class:active={view === 'summary'} onclick={() => { view = 'summary'; jobSel = null; }}>
+      <span class="g" aria-hidden="true">◈</span><span class="nname">Summary</span>
     </button>
-    <button type="button" class="snav-item" class:active={view === 'yaml'} onclick={() => { view = 'yaml'; jobSel = null; }}>
-      <span class="g" aria-hidden="true">☰</span><span class="nname">Pipeline file</span>
-      <span class="ndur">{run?.pipeline_file.split('/').pop() ?? ''}</span>
-    </button>
-    <div class="snav-group">Stages</div>
+    <div class="snav-group">Jobs</div>
     {#each stages as stage (stage)}
       {@const jobs = stageJobs(stage)}
       <button
@@ -422,39 +407,62 @@
         {/each}
       </div>
     {/each}
+    <div class="snav-group">Run details</div>
+    <button type="button" class="snav-item" class:active={view === 'yaml'} onclick={() => { view = 'yaml'; jobSel = null; }}>
+      <span class="g" aria-hidden="true">☰</span><span class="nname">Workflow file</span>
+      <span class="ndur">{run?.pipeline_file.split('/').pop() ?? ''}</span>
+    </button>
   </nav>
 
   <div class="run-content">
     {#if error}<div class="err-banner">{error}</div>{/if}
 
     {#if run}
-      {#if view === 'overview'}
-        <div class="ov-stats">
-          <span class="card ovstat"><span class="k">duration</span><span class="v">{fmtDur(runEnd(run) - run.started_at)}</span></span>
-          <span class="card ovstat">
-            <span class="k">jobs</span>
-            <span class="v">
-              {passed}/{run.jobs.length}
-              {#if failedCount}<span class="bad">· {failedCount} failed</span>{:else}passed{/if}
+      {#if view === 'summary'}
+        <div class="card sum-card">
+          <div class="sum-trigger">
+            <span class="sum-k">Triggered via {run.trigger === 'webhook' ? 'push' : run.trigger} {ago(run.started_at, $now)}</span>
+            <span class="sum-who">
+              {#if run.commit}
+                <b>{run.commit.author}</b> pushed
+                <span class="sha-chip2">{run.commit.sha}</span>
+              {:else}
+                started from the dashboard
+              {/if}
+              <span class="repo-tag2">{run.repo}</span>
             </span>
-          </span>
-          <span class="card ovstat"><span class="k">stages</span><span class="v">{stages.length}</span></span>
-          <span class="card ovstat"><span class="k">workers</span><span class="v">{runWorkers.length}</span></span>
+          </div>
+          <div class="sum-cell">
+            <span class="sum-k">Status</span>
+            <span class="sum-v st-{run.status}">{STATUS_TEXT[run.status]}</span>
+          </div>
+          <div class="sum-cell">
+            <span class="sum-k">Total duration</span>
+            <span class="sum-v">{fmtDur(runEnd(run) - run.started_at)}</span>
+          </div>
+          <div class="sum-cell">
+            <span class="sum-k">Jobs</span>
+            <span class="sum-v">{passed}/{run.jobs.length} <span class="sum-sub">passed</span></span>
+          </div>
+          <div class="sum-cell">
+            <span class="sum-k">Artifacts</span>
+            <span class="sum-v">{artifactCount}</span>
+          </div>
         </div>
 
         <div class="card flow-card-canvas">
           <div class="flow-head">
-            <span class="glabel">Pipeline execution flow</span>
+            <span class="fname">{run.pipeline_file.split('/').pop()}</span>
+            <span class="fon">on: {run.trigger === 'webhook' ? 'push' : run.trigger}</span>
             <button
               type="button"
-              class="fname fname-btn"
+              class="fname-btn"
               title={run.repo ? `${run.pipeline_file} — view the file` : 'this run has no registered repo to fetch the file from'}
               disabled={!run.repo}
               onclick={() => (view = 'yaml')}
             >
-              {run.pipeline_file.split('/').pop()} →
+              view file →
             </button>
-            <span class="fon">on: {run.trigger === 'webhook' ? 'push' : run.trigger}</span>
             <span class="zoom-ctrls">
               <button class="zoombtn" onclick={() => zoomCenter(1 / 1.2)} aria-label="Zoom out">−</button>
               <span class="zoom-pct">{Math.round(scale * 100)}%</span>
@@ -529,34 +537,30 @@
           </div>
         </div>
 
-        <div class="section-label">Worker utilization
-          <span class="meta">share of time busy across the run window</span>
-        </div>
-        <div class="util-grid" style="margin-bottom:24px">
-          {#if runWorkers.length}
-            {#each runWorkers as name (name)}
-              <div class="card util-card" class:offline={workerStatus.get(name) === 'offline'}>
-                <div class="util-head">
-                  <span class="dot" aria-hidden="true"></span>{name}
-                  <span class="umeta">
-                    jobs <b>{jobsOf(name, run.jobs)}</b> · busy <b>{busyPct(name, run.jobs, run.started_at, runEnd(run))}%</b> of run
+        {#if failedJobs.length}
+          <div class="card annots">
+            <div class="annots-head">Annotations <span class="meta2">{failedJobs.length} error{failedJobs.length === 1 ? '' : 's'}</span></div>
+            {#each failedJobs as j (j.id)}
+              <button type="button" class="annot" onclick={() => selectJob(j)}>
+                <span class="ann-ico" aria-hidden="true">✕</span>
+                <span class="ann-body">
+                  <b>{j.name}</b>
+                  <span class="ann-msg">
+                    {j.started_at
+                      ? `Process completed with exit code ${j.exit_code ?? 1}.`
+                      : 'Skipped — a dependency failed.'}
                   </span>
-                </div>
-                <canvas
-                  class="utilchart"
-                  use:utilChart={workerUtilParams(name, run.jobs, run.started_at, runEnd(run))}
-                  aria-label="Utilization of {name} during this run"
-                ></canvas>
-              </div>
+                </span>
+              </button>
             {/each}
-          {:else}
-            <div class="empty">No jobs have been assigned to a worker yet.</div>
-          {/if}
-        </div>
+          </div>
+        {/if}
+
+        <DeviceMonitor {workers} series={statSeries} names={runWorkers} now={$now} />
       {:else if view === 'yaml'}
         <div class="card yaml-card">
           <div class="yaml-card-head">
-            <span class="glabel">Pipeline file</span>
+            <span class="glabel">Workflow file for this run</span>
             <span class="mono yfile">{yaml?.file ?? run.pipeline_file}</span>
             <span class="fon">defines this run's stages, jobs and placement</span>
           </div>
@@ -579,11 +583,12 @@
         {#if selJob}
           <div class="job-shell">
             <div class="job-main">
-              <div class="term term-xl" class:failed={selJob.status === 'failed'}>
-                <div class="term-head">
-                  <span class="dot" aria-hidden="true"></span>{selJob.worker ?? 'unassigned'}
-                  <span class="tjob" title={selJob.name}>{selJob.status === 'failed' ? `${GLYPH.failed} ` : ''}{selJob.name}</span>
-                  <span class="term-tools">
+              <div class="card logcard logcard-xl" class:failed={selJob.status === 'failed'}>
+                <div class="logcard-head">
+                  <span class="ghst sm {selJob.status}" aria-hidden="true">{GLYPH[selJob.status]}</span>
+                  <span class="lc-name" title={selJob.name}>{selJob.name}</span>
+                  <span class="lc-meta">{jobStatusLine(selJob)}</span>
+                  <span class="log-tools">
                     {#if hasSteps}
                       <button type="button" class="ttool" aria-pressed={!logRaw} onclick={() => (logRaw = !logRaw)}>
                         {logRaw ? 'raw' : 'steps'}
@@ -603,7 +608,7 @@
                   </span>
                 </div>
                 <div
-                  class="term-body full xl"
+                  class="logpane xl"
                   class:wrapped={logWrap}
                   bind:this={logBody}
                   onscroll={onLogScroll}
@@ -613,7 +618,7 @@
                   {#if !log.length}
                     <div class="lnrow">
                       <span class="lnum" aria-hidden="true"></span>
-                      <span class="ltxt" style="color:var(--term-muted)">queued — no output yet</span>
+                      <span class="ltxt meta">queued — no output yet</span>
                     </div>
                   {:else if hasSteps && !logRaw}
                     {#each steps as s, si (si)}
@@ -637,7 +642,7 @@
                     {/each}
                   {/if}
                 </div>
-                <div class="term-foot">
+                <div class="logcard-foot">
                   <span class="tcmd" title="$ {selJob.command}">$ {selJob.command}</span>
                   {#if selJob.status === 'running'}
                     <span class="tlines streaming">streaming…</span>
@@ -679,50 +684,30 @@
         {:else}
           <div class="stage-row">
             <div>
-              <div class="section-label">Worker utilization <span class="meta">within this stage's window</span></div>
-              {#if !win || !stWorkers.length}
-                <div class="empty">This stage has not started yet.</div>
-              {:else}
-                <div class="util-grid">
-                  {#each stWorkers as name (name)}
-                    <div class="card util-card" class:offline={workerStatus.get(name) === 'offline'}>
-                      <div class="util-head">
-                        <span class="dot" aria-hidden="true"></span>{name}
-                        <span class="umeta">jobs <b>{jobsOf(name, jobs)}</b> · busy <b>{busyPct(name, jobs, win.t0, win.t1)}%</b></span>
-                      </div>
-                      <canvas
-                        class="utilchart"
-                        use:utilChart={workerUtilParams(name, jobs, win.t0, win.t1)}
-                        aria-label="Utilization of {name}"
-                      ></canvas>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-
-              <div class="section-label" style="margin-top:20px">Command logs
+              <div class="section-label">Job logs
                 <span class="meta">full output of every job in {view}</span>
               </div>
               {#each jobs as j (j.id)}
                 {@const jlog = stageLogs[j.id] ?? []}
-                <div class="term stage-term" class:failed={j.status === 'failed'}>
-                  <div class="term-head">
-                    <span class="dot" aria-hidden="true"></span>{j.worker ?? 'unassigned'}
-                    <span class="tjob" title={j.name}>{j.status === 'failed' ? `${GLYPH.failed} ` : ''}{j.name}</span>
+                <div class="card logcard stage-term" class:failed={j.status === 'failed'}>
+                  <div class="logcard-head">
+                    <span class="ghst sm {j.status}" aria-hidden="true">{GLYPH[j.status]}</span>
+                    <span class="lc-name" title={j.name}>{j.name}</span>
+                    <span class="lc-meta">{j.worker ?? 'unassigned'}</span>
                   </div>
-                  <div class="term-body full stage-log" role="log" aria-label="Log for {j.name}">
+                  <div class="logpane stage-log" role="log" aria-label="Log for {j.name}">
                     {#each jlog as l, i (i)}
                       {@render logline(l.t, i + 1, rawKind(l.t))}
                     {:else}
                       <div class="lnrow">
                         <span class="lnum" aria-hidden="true"></span>
-                        <span class="ltxt" style="color:var(--term-muted)">
+                        <span class="ltxt meta">
                           {j.started_at || j.finished_at ? 'no output yet' : 'queued — waiting for a worker'}
                         </span>
                       </div>
                     {/each}
                   </div>
-                  <div class="term-foot">
+                  <div class="logcard-foot">
                     <span class="tcmd" title="$ {j.command}">$ {j.command}</span>
                     {#if j.status === 'running'}
                       <span class="tlines streaming">streaming…</span>

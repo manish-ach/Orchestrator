@@ -18,7 +18,8 @@ use sqlx::{PgPool, Row};
 
 use crate::pipeline::Plan;
 use crate::types::{
-    CalendarDay, ClaimedJob, Commit, Job, JobStatus, Repo, ReportRequest, Run, Status, TriggerKind, Worker,
+    CalendarDay, ClaimedJob, Commit, Job, JobStatus, Repo, ReportRequest, Run, StatSample, Status, TriggerKind,
+    Worker, WorkerStats, WorkerStatsSeries,
 };
 
 pub type SharedStore = Arc<Store>;
@@ -36,8 +37,16 @@ const PRUNE_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 /// Dashboard sessions live this long in Redis (seconds).
 const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// How many heartbeat stat samples to keep per worker. At the 2s heartbeat
+/// interval this is ~15 minutes of CPU/RAM history for the dashboard.
+const STATS_HISTORY_LEN: isize = 450;
+
 fn worker_queue(worker_id: &str) -> String {
     format!("jobs:ready:{worker_id}")
+}
+
+fn stats_key(worker_id: &str) -> String {
+    format!("workers:stats:{worker_id}")
 }
 
 const MIGRATIONS: &str = r#"
@@ -95,6 +104,9 @@ struct WorkerRecord {
     #[serde(default)]
     tags: Vec<String>,
     job_id: Option<i64>,
+    /// latest machine stats from the heartbeat
+    #[serde(default)]
+    stats: Option<WorkerStats>,
 }
 
 pub struct Store {
@@ -152,6 +164,7 @@ impl Store {
             let Ok(rec) = serde_json::from_str::<WorkerRecord>(&raw) else { continue };
             if rec.name == name && now - rec.last_heartbeat > HEARTBEAT_TIMEOUT_MS {
                 let _: () = r.hdel(WORKERS_KEY, &other_id).await.map_err(|e| e.to_string())?;
+                let _: () = r.del(stats_key(&other_id)).await.map_err(|e| e.to_string())?;
             }
         }
 
@@ -161,6 +174,7 @@ impl Store {
             registered_at,
             tags: tags.to_vec(),
             job_id: None,
+            stats: None,
         })
         .unwrap();
         let _: () = r.hset(WORKERS_KEY, &id, rec).await.map_err(|e| e.to_string())?;
@@ -182,11 +196,38 @@ impl Store {
         Ok(())
     }
 
-    pub async fn heartbeat(&self, id: &str) -> Result<bool, String> {
+    pub async fn heartbeat(&self, id: &str, stats: Option<&WorkerStats>) -> Result<bool, String> {
         let Some(mut rec) = self.get_worker(id).await? else { return Ok(false) };
-        rec.last_heartbeat = now_ms();
+        let now = now_ms();
+        rec.last_heartbeat = now;
+        if let Some(stats) = stats {
+            rec.stats = Some(stats.clone());
+        }
         self.put_worker(id, &rec).await?;
+
+        // append to the per-worker history the dashboard graphs; capped so
+        // Redis holds a rolling window, not an unbounded series
+        if let Some(stats) = stats {
+            let sample = serde_json::to_string(&StatSample { t: now, cpu: stats.cpu_pct, mem: stats.mem_pct }).unwrap();
+            let mut r = self.redis.clone();
+            let key = stats_key(id);
+            let _: () = r.rpush(&key, sample).await.map_err(|e| e.to_string())?;
+            let _: () = r.ltrim(&key, -STATS_HISTORY_LEN, -1).await.map_err(|e| e.to_string())?;
+        }
         Ok(true)
+    }
+
+    /// Recent CPU/RAM sample history for every registered worker.
+    pub async fn worker_stats(&self) -> Result<Vec<WorkerStatsSeries>, String> {
+        let workers = self.list_workers().await?;
+        let mut r = self.redis.clone();
+        let mut out = Vec::with_capacity(workers.len());
+        for w in workers {
+            let raw: Vec<String> = r.lrange(stats_key(&w.id), 0, -1).await.map_err(|e| e.to_string())?;
+            let samples = raw.iter().filter_map(|s| serde_json::from_str(s).ok()).collect();
+            out.push(WorkerStatsSeries { id: w.id, name: w.name, status: w.status, samples });
+        }
+        Ok(out)
     }
 
     pub async fn list_workers(&self) -> Result<Vec<Worker>, String> {
@@ -205,6 +246,7 @@ impl Store {
                     registered_at: rec.registered_at,
                     tags: rec.tags,
                     job_id: rec.job_id,
+                    stats: rec.stats,
                 })
             })
             .collect();
@@ -488,6 +530,7 @@ impl Store {
         for w in &workers {
             if now - w.last_heartbeat > PRUNE_AFTER_MS {
                 let _: () = redis.hdel(WORKERS_KEY, &w.id).await.map_err(|e| e.to_string())?;
+                let _: () = redis.del(stats_key(&w.id)).await.map_err(|e| e.to_string())?;
             }
         }
 

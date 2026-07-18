@@ -12,7 +12,7 @@ use crate::pipeline::{self, Plan};
 use crate::store::SharedStore;
 use crate::types::{
     AddRepoRequest, CalendarDay, ClaimedJob, Commit, HealthReport, Job, RegisterResponse, Repo, ReportRequest, Run,
-    TriggerKind, TriggerRequest, Worker, WorkerRequest,
+    TriggerKind, TriggerRequest, Worker, WorkerRequest, WorkerStatsSeries,
 };
 
 type ApiError = (StatusCode, String);
@@ -56,6 +56,7 @@ pub fn router(store: SharedStore) -> Router {
     // keep working without a password.
     let dashboard = Router::new()
         .route("/api/workers", get(list_workers))
+        .route("/api/workers/stats", get(worker_stats))
         .route("/api/pipelines/trigger", post(trigger_pipeline))
         .route("/api/jobs", get(list_jobs))
         .route("/api/runs", get(list_runs))
@@ -136,6 +137,12 @@ async fn list_workers(State(store): State<SharedStore>) -> Result<Json<Vec<Worke
     Ok(Json(store.list_workers().await.map_err(internal)?))
 }
 
+/// Rolling CPU/RAM history per worker (fed by heartbeats) — the dashboard's
+/// device monitor graphs read this.
+async fn worker_stats(State(store): State<SharedStore>) -> Result<Json<Vec<WorkerStatsSeries>>, ApiError> {
+    Ok(Json(store.worker_stats().await.map_err(internal)?))
+}
+
 async fn register(
     State(store): State<SharedStore>,
     Json(req): Json<WorkerRequest>,
@@ -162,7 +169,7 @@ async fn heartbeat(
     State(store): State<SharedStore>,
     Json(req): Json<WorkerRequest>,
 ) -> Result<(), ApiError> {
-    let known = store.heartbeat(&ident(&req)).await.map_err(internal)?;
+    let known = store.heartbeat(&ident(&req), req.stats.as_ref()).await.map_err(internal)?;
     if !known {
         println!("Worker {} not known!", req.worker_name);
     }

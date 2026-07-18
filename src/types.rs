@@ -137,6 +137,35 @@ pub struct HealthReport {
     pub online_workers: u16,
 }
 
+/// Point-in-time machine stats a worker samples and sends with every
+/// heartbeat, so the dashboard can graph real CPU/RAM per device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStats {
+    /// whole-machine CPU usage, 0–100
+    pub cpu_pct: f32,
+    /// used / total physical memory, 0–100
+    pub mem_pct: f32,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+}
+
+/// One stored stats sample; `t` is ms epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatSample {
+    pub t: i64,
+    pub cpu: f32,
+    pub mem: f32,
+}
+
+/// GET /api/workers/stats — the recent sample history of one worker.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerStatsSeries {
+    pub id: String,
+    pub name: String,
+    pub status: Status,
+    pub samples: Vec<StatSample>,
+}
+
 /// Worker as the API serves it; `last_heartbeat` is ms epoch per the
 /// dashboard contract. Live state lives in Redis, keyed by the unique id
 /// minted at first registration.
@@ -152,6 +181,8 @@ pub struct Worker {
     /// pipeline yml matches against
     pub tags: Vec<String>,
     pub job_id: Option<i64>,
+    /// latest machine stats from the heartbeat; None until one arrives
+    pub stats: Option<WorkerStats>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,6 +194,9 @@ pub struct WorkerRequest {
     /// capability labels; only meaningful on register
     #[serde(default)]
     pub tags: Vec<String>,
+    /// machine stats; only sent with heartbeats
+    #[serde(default)]
+    pub stats: Option<WorkerStats>,
 }
 
 #[derive(Serialize, Deserialize)]

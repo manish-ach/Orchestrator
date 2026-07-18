@@ -24,7 +24,7 @@ which also makes CORS a non-issue because the UI and the API share an origin.
 | `#/runs`           | Full run history: status filter chips + search over every run               |
 | `#/repos`          | Repository list with search and latest-run bars                             |
 | `#/repo/<name>`    | One repo: latest-run hero, pipeline switcher, runs, About/Contributors/Languages |
-| `#/run/<id>`       | One run: flow canvas, per-stage stats + utilization, per-job full logs      |
+| `#/run/<id>`       | One run (GitHub Actions-style): summary + DAG canvas, annotations, device monitor (real CPU/RAM), per-job full logs |
 | `#/run/<id>?job=<id>` | Deep link straight into a job's log view                                 |
 | `#/monitor`        | Fleet utilization + per-worker health/timeline cards                        |
 
@@ -73,6 +73,7 @@ the coordinator gets it (Postgres, memory, the Forgejo API) is its business.
 | `GET  /api/auth/status`       | `{ "required": true }` when the coordinator has `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` set |
 | `POST /api/auth/login`        | `{ "username", "password" }` → `{ "token" }`; the dashboard sends it as `Authorization: Bearer <token>` on every call below (workers/webhooks stay tokenless) |
 | `GET  /api/workers`           | see Worker below                          |
+| `GET  /api/workers/stats`     | rolling CPU/RAM sample history per worker (shape below) |
 | `GET  /api/jobs`              | flat job list across all runs             |
 | `POST /api/pipelines/trigger` | optional `{ "repo": "<name>" }` body — runs that repo's pipeline YAML (parsed by yaml-parser); without it, the local pipeline.yml. Returns `{ "id": <run id> }` |
 | `GET  /api/runs`              | runs with nested jobs (shape below)       |
@@ -135,20 +136,33 @@ private repos.
 }
 ```
 
-The dashboard derives *everything else* from these two shapes: timelines,
-utilization charts, per-stage stats, the monitor's fleet graph — no extra
-metrics endpoints are needed (and none should be invented: there is no
-CPU/RAM data in this system).
+The dashboard derives activity data (timelines, per-stage stats, the
+monitor's fleet graph) from these two shapes. Machine-level CPU/RAM is the
+one exception: workers *measure* it and ship it with every heartbeat, so
+the device monitor graphs real numbers instead of inferring them.
 
 **3. Workers** (`last_heartbeat`/`registered_at` are ms epoch; state lives
 in Redis and `status` is computed from heartbeat age; `tags` are the
-capability labels from `--tags`/`WORKER_TAGS`):
+capability labels from `--tags`/`WORKER_TAGS`; `stats` is the latest
+machine sample from the heartbeat, `null` until one arrives):
 
 ```jsonc
 // GET /api/workers → Worker[]
 { "id": "6f9c…", "name": "rechek", "status": "online",
   "last_heartbeat": 1783240050000, "registered_at": 1783150000000,
-  "tags": ["heavy"], "job_id": 7 }
+  "tags": ["heavy"], "job_id": 7,
+  "stats": { "cpu_pct": 57.2, "mem_pct": 58.1,
+             "mem_used_mb": 9420, "mem_total_mb": 16384 } }
+```
+
+**3b. Worker stats history.** Each heartbeat (every 2s) appends a sample;
+the coordinator keeps the last 450 per worker (~15 min) in Redis. The run
+screen's device monitor draws these directly:
+
+```jsonc
+// GET /api/workers/stats → WorkerStatsSeries[]
+{ "id": "6f9c…", "name": "rechek", "status": "online",
+  "samples": [{ "t": 1783240050000, "cpu": 57.2, "mem": 58.1 }, ...] }
 ```
 
 **4. Repos.** The coordinator proxies Forgejo: repo info from

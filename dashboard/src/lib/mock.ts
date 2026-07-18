@@ -2,7 +2,8 @@
 // including one run that progresses in real time while the page polls.
 
 import type {
-  Api, CalendarDay, Commit, Job, JobDetail, LogLine, Overview, Repo, Run, Trigger, Worker,
+  Api, CalendarDay, Commit, Job, JobDetail, LogLine, Overview, Repo, Run, StatSample, Trigger, Worker,
+  WorkerStatsSeries,
 } from './types';
 
 interface PlanStep { stage: string; name: string; command: string; dur: number }
@@ -523,6 +524,57 @@ function logFor(job: Job): LogLine[] {
 
 buildHistory();
 
+// ---- simulated device stats (CPU / RAM per worker) --------------------------
+// A 2s-cadence random walk per worker, biased upward while that worker has a
+// running job — mirrors what real heartbeats report in live mode.
+
+interface StatWalk {
+  samples: StatSample[];
+  lastT: number;
+  cpu: number;
+  mem: number;
+}
+
+const STAT_STEP_MS = 2000;
+const STAT_KEEP = 450;
+const statWalks = new Map<string, StatWalk>();
+
+function jobRunningOn(name: string, t: number): boolean {
+  return state.runs.some((r) =>
+    r.jobs.some(
+      (j) => j.worker === name && j.started_at !== null && j.started_at <= t && (j.finished_at ?? Infinity) >= t,
+    ),
+  );
+}
+
+function extendStats(): void {
+  const now = Date.now();
+  for (const w of state.workers) {
+    let walk = statWalks.get(w.name);
+    if (!walk) {
+      walk = {
+        samples: [],
+        lastT: now - 5 * 60 * 1000,
+        cpu: 8 + Math.random() * 10,
+        mem: 38 + Math.random() * 18,
+      };
+      statWalks.set(w.name, walk);
+    }
+    // offline workers stop heartbeating — their series simply ends
+    const horizon = w.status === 'online' ? now : w.last_heartbeat;
+    for (let t = walk.lastT + STAT_STEP_MS; t <= horizon; t += STAT_STEP_MS) {
+      const busy = jobRunningOn(w.name, t);
+      walk.cpu += ((busy ? 74 : 11) - walk.cpu) * 0.22 + (Math.random() - 0.5) * 9;
+      walk.cpu = Math.min(99, Math.max(1, walk.cpu));
+      walk.mem += ((busy ? 63 : 46) - walk.mem) * 0.05 + (Math.random() - 0.5) * 1.6;
+      walk.mem = Math.min(97, Math.max(8, walk.mem));
+      walk.samples.push({ t, cpu: Math.round(walk.cpu * 10) / 10, mem: Math.round(walk.mem * 10) / 10 });
+      walk.lastT = t;
+    }
+    if (walk.samples.length > STAT_KEEP) walk.samples.splice(0, walk.samples.length - STAT_KEEP);
+  }
+}
+
 function dayKey(ts: number): string {
   const d = new Date(ts);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -622,10 +674,34 @@ export const mockApi: Api = {
   },
   async overview(): Promise<Overview> {
     tick();
+    extendStats();
+    const workers = structuredClone(state.workers);
+    for (const w of workers) {
+      const last = statWalks.get(w.name)?.samples.at(-1);
+      if (last) {
+        const total = 16384;
+        w.stats = {
+          cpu_pct: last.cpu,
+          mem_pct: last.mem,
+          mem_used_mb: Math.round((last.mem / 100) * total),
+          mem_total_mb: total,
+        };
+      }
+    }
     return {
-      workers: structuredClone(state.workers),
+      workers,
       runs: structuredClone(state.runs).sort((a, b) => b.started_at - a.started_at),
     };
+  },
+  async workerStats(): Promise<WorkerStatsSeries[]> {
+    tick();
+    extendStats();
+    return state.workers.map((w) => ({
+      id: w.name,
+      name: w.name,
+      status: w.status,
+      samples: structuredClone(statWalks.get(w.name)?.samples ?? []),
+    }));
   },
   async run(id: number | string): Promise<Run | null> {
     tick();
