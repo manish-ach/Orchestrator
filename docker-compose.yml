@@ -18,7 +18,12 @@ name: orchestrator
 
 services:
   coordinator:
-    build: .
+    # ORCHESTRATOR_DOCKERFILE=Dockerfile.prebuilt builds the runtime-only
+    # image from pipeline-built artifacts instead of compiling here —
+    # that's how self-deploy stays fast on a weak server
+    build:
+      context: .
+      dockerfile: ${ORCHESTRATOR_DOCKERFILE:-Dockerfile}
     container_name: orchestrator-coordinator
     ports:
       - "8080:8080"
@@ -51,7 +56,9 @@ services:
       - "9000:9000"
 
   worker:
-    build: .
+    build:
+      context: .
+      dockerfile: ${ORCHESTRATOR_DOCKERFILE:-Dockerfile}
     command: ["orchestrator", "worker", "--name", "worker-1"]
     environment:
       COORDINATOR_URL: http://coordinator:8080
