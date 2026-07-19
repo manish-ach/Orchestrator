@@ -21,6 +21,7 @@ which also makes CORS a non-issue because the UI and the API share an origin.
 | Route              | What it shows                                                              |
 | ------------------ | -------------------------------------------------------------------------- |
 | `#/`               | Overview: stat tiles, contribution calendar, worker utilization, updates feed |
+| `#/runs`           | Full run history: status filter chips + search over every run               |
 | `#/repos`          | Repository list with search and latest-run bars                             |
 | `#/repo/<name>`    | One repo: latest-run hero, pipeline switcher, runs, About/Contributors/Languages |
 | `#/run/<id>`       | One run: flow canvas, per-stage stats + utilization, per-job full logs      |
