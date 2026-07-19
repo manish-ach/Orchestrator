@@ -86,6 +86,9 @@ pub struct Job {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub has_artifacts: bool,
+    /// worker capability labels this job requires (yml `tags:`)
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub status: JobStatus,
     pub worker: Option<String>,
     #[serde(default)]
@@ -143,6 +146,11 @@ pub struct Worker {
     pub name: String,
     pub status: Status,
     pub last_heartbeat: i64,
+    /// ms epoch of the first registration — the dashboard shows uptime
+    pub registered_at: i64,
+    /// capability labels (`--tags heavy,docker`) that `tags:` in a
+    /// pipeline yml matches against
+    pub tags: Vec<String>,
     pub job_id: Option<i64>,
 }
 
@@ -152,6 +160,9 @@ pub struct WorkerRequest {
     /// unique id from a previous registration; absent on first contact
     #[serde(default)]
     pub worker_id: Option<String>,
+    /// capability labels; only meaningful on register
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]

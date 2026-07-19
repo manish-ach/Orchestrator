@@ -30,6 +30,11 @@ const HEARTBEAT_TIMEOUT_MS: i64 = 5_000;
 /// much longer than the offline display threshold so a hiccup doesn't
 /// double-execute a job that is still running.
 const REQUEUE_AFTER_MS: i64 = 30_000;
+/// Workers silent this long are dropped from the registry entirely, so a
+/// decommissioned machine doesn't clutter the monitor forever.
+const PRUNE_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
+/// Dashboard sessions live this long in Redis (seconds).
+const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn worker_queue(worker_id: &str) -> String {
     format!("jobs:ready:{worker_id}")
@@ -69,6 +74,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS worker_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS queued_for TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS artifacts JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS has_artifacts BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;
 CREATE TABLE IF NOT EXISTS repos (
     remote TEXT PRIMARY KEY,
     data   JSONB NOT NULL
@@ -83,6 +89,11 @@ fn now_ms() -> i64 {
 struct WorkerRecord {
     name: String,
     last_heartbeat: i64,
+    // defaults keep records written by older coordinators readable
+    #[serde(default)]
+    registered_at: i64,
+    #[serde(default)]
+    tags: Vec<String>,
     job_id: Option<i64>,
 }
 
@@ -118,13 +129,37 @@ impl Store {
     // ---- workers (Redis, keyed by unique id) ---------------------------
 
     /// First contact mints a unique id; re-registration with a known id
-    /// just refreshes the record (name changes included).
-    pub async fn register(&self, name: &str, id: Option<String>) -> Result<String, String> {
+    /// just refreshes the record (name changes included). Offline records
+    /// carrying the same name are dropped — a container that lost its id
+    /// file re-registers as a "new" worker, and without this the registry
+    /// fills with dead duplicates that break the dashboard.
+    pub async fn register(&self, name: &str, id: Option<String>, tags: &[String]) -> Result<String, String> {
         let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let registered_at = self
+            .get_worker(&id)
+            .await?
+            .map(|rec| rec.registered_at)
+            .filter(|&t| t > 0)
+            .unwrap_or_else(now_ms);
+
         let mut r = self.redis.clone();
+        let now = now_ms();
+        let all: HashMap<String, String> = r.hgetall(WORKERS_KEY).await.map_err(|e| e.to_string())?;
+        for (other_id, raw) in all {
+            if other_id == id {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<WorkerRecord>(&raw) else { continue };
+            if rec.name == name && now - rec.last_heartbeat > HEARTBEAT_TIMEOUT_MS {
+                let _: () = r.hdel(WORKERS_KEY, &other_id).await.map_err(|e| e.to_string())?;
+            }
+        }
+
         let rec = serde_json::to_string(&WorkerRecord {
             name: name.to_string(),
-            last_heartbeat: now_ms(),
+            last_heartbeat: now,
+            registered_at,
+            tags: tags.to_vec(),
             job_id: None,
         })
         .unwrap();
@@ -167,6 +202,8 @@ impl Store {
                     name: rec.name,
                     status: if now - rec.last_heartbeat <= HEARTBEAT_TIMEOUT_MS { Status::Online } else { Status::Offline },
                     last_heartbeat: rec.last_heartbeat,
+                    registered_at: rec.registered_at,
+                    tags: rec.tags,
                     job_id: rec.job_id,
                 })
             })
@@ -193,6 +230,19 @@ impl Store {
             .into_iter()
             .find(|w| w.name == name && matches!(w.status, Status::Online))
             .map(|w| w.id))
+    }
+
+    /// Pick an online worker whose tag set covers every tag the job asks
+    /// for; an idle one wins over a busy one.
+    async fn find_worker_by_tags(&self, tags: &[String]) -> Result<Option<String>, String> {
+        let mut candidates: Vec<Worker> = self
+            .list_workers()
+            .await?
+            .into_iter()
+            .filter(|w| matches!(w.status, Status::Online) && tags.iter().all(|t| w.tags.contains(t)))
+            .collect();
+        candidates.sort_by_key(|w| w.job_id.is_some());
+        Ok(candidates.into_iter().next().map(|w| w.id))
     }
 
     async fn worker_fresh(&self, id: &str, within_ms: i64) -> Result<bool, String> {
@@ -244,8 +294,13 @@ impl Store {
         for job in &plan.jobs {
             let mut env = inject_env.clone();
             env.extend(job.env.clone());
+            // `worker: <name>` in the yml is sugar for env WORKER_PIN — the
+            // explicit field wins over an env entry
+            if let Some(pin) = &job.worker {
+                env.insert("WORKER_PIN".to_string(), pin.clone());
+            }
             sqlx::query(
-                "INSERT INTO jobs (run_id, stage, name, command, needs, env, artifacts) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                "INSERT INTO jobs (run_id, stage, name, command, needs, env, artifacts, tags) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(run_id)
             .bind(&job.stage)
@@ -254,6 +309,7 @@ impl Store {
             .bind(serde_json::json!(job.needs))
             .bind(serde_json::json!(env))
             .bind(serde_json::json!(job.artifacts))
+            .bind(serde_json::json!(job.tags))
             .execute(&self.db)
             .await
             .map_err(|e| e.to_string())?;
@@ -268,7 +324,7 @@ impl Store {
     /// worker that ran them (files are probably warm there); independent
     /// jobs go to the global queue for any free worker.
     async fn enqueue_ready(&self, run_id: i64) -> Result<(), String> {
-        let rows = sqlx::query("SELECT id, needs, env FROM jobs WHERE run_id = $1 AND status = 'pending' AND queued = FALSE ORDER BY id")
+        let rows = sqlx::query("SELECT id, needs, env, tags FROM jobs WHERE run_id = $1 AND status = 'pending' AND queued = FALSE ORDER BY id")
             .bind(run_id)
             .fetch_all(&self.db)
             .await
@@ -304,6 +360,18 @@ impl Store {
                 target = self.find_worker_by_name(pin).await?;
                 if target.is_none() {
                     println!("Job {id}: WORKER_PIN '{pin}' matches no online worker — any worker may claim it");
+                }
+            }
+
+            // `tags:` is a hard constraint: only a worker carrying every
+            // tag may run the job. No match online → the job stays
+            // unqueued; the reconciler retries placement until one appears.
+            let tags: Vec<String> =
+                serde_json::from_value(row.get::<serde_json::Value, _>("tags")).unwrap_or_default();
+            if target.is_none() && !tags.is_empty() {
+                target = self.find_worker_by_tags(&tags).await?;
+                if target.is_none() {
+                    continue;
                 }
             }
 
@@ -415,6 +483,14 @@ impl Store {
         let mut redis = self.redis.clone();
         let mut touched = false;
 
+        // registry hygiene: a machine silent for a day is gone, not flaky —
+        // drop its record so the monitor only lists real fleet members
+        for w in &workers {
+            if now - w.last_heartbeat > PRUNE_AFTER_MS {
+                let _: () = redis.hdel(WORKERS_KEY, &w.id).await.map_err(|e| e.to_string())?;
+            }
+        }
+
         for id in &dead {
             loop {
                 let popped: Option<i64> = redis.lpop(worker_queue(id), None).await.map_err(|e| e.to_string())?;
@@ -451,17 +527,19 @@ impl Store {
             }
         }
 
-        if touched {
-            let run_ids: Vec<i64> =
-                sqlx::query("SELECT DISTINCT run_id FROM jobs WHERE status = 'pending' AND queued = FALSE")
-                    .fetch_all(&self.db)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .map(|r| r.get::<i64, _>("run_id"))
-                    .collect();
-            for run_id in run_ids {
-                self.enqueue_ready(run_id).await?;
+        // Always retry placement of pending unqueued jobs — a tag- or
+        // pin-constrained job waits here until a matching worker shows up.
+        let run_ids: Vec<i64> =
+            sqlx::query("SELECT DISTINCT run_id FROM jobs WHERE status = 'pending' AND queued = FALSE")
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|r| r.get::<i64, _>("run_id"))
+                .collect();
+        for run_id in run_ids {
+            self.enqueue_ready(run_id).await?;
+            if touched {
                 self.roll_up(run_id).await?;
             }
         }
@@ -723,6 +801,24 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    // ---- dashboard sessions (Redis) --------------------------------------
+
+    /// Mint a login session for the dashboard; expires on its own in Redis.
+    pub async fn create_session(&self) -> Result<String, String> {
+        let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let mut r = self.redis.clone();
+        let _: () = r
+            .set_ex(format!("dash:session:{token}"), 1, SESSION_TTL_SECS)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(token)
+    }
+
+    pub async fn session_valid(&self, token: &str) -> Result<bool, String> {
+        let mut r = self.redis.clone();
+        r.exists(format!("dash:session:{token}")).await.map_err(|e| e.to_string())
+    }
+
     // ---- calendar -------------------------------------------------------
 
     pub async fn calendar(&self) -> Result<Vec<CalendarDay>, String> {
@@ -764,6 +860,7 @@ fn job_from_row(row: &sqlx::postgres::PgRow) -> Job {
         env: serde_json::from_value(row.get::<serde_json::Value, _>("env")).unwrap_or_default(),
         artifacts: serde_json::from_value(row.get::<serde_json::Value, _>("artifacts")).unwrap_or_default(),
         has_artifacts: row.get("has_artifacts"),
+        tags: serde_json::from_value(row.get::<serde_json::Value, _>("tags")).unwrap_or_default(),
         status: JobStatus::from_str(&row.get::<String, _>("status")),
         worker: row.get("worker"),
         worker_id: row.get("worker_id"),

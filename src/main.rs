@@ -25,6 +25,9 @@ enum Module {
         ///Command executor address on this machine [env: EXECUTOR_URL]
         #[arg(long)]
         executor: Option<String>,
+        ///Comma-separated capability tags, e.g. heavy,docker [env: WORKER_TAGS]
+        #[arg(long)]
+        tags: Option<String>,
     },
 }
 
@@ -43,6 +46,6 @@ async fn main() {
 
     match args.module {
         Module::Coordinator { port } => coordinator::execute(port).await,
-        Module::Worker { name, coordinator, executor } => worker::run(name, coordinator, executor).await,
+        Module::Worker { name, coordinator, executor, tags } => worker::run(name, coordinator, executor, tags).await,
     }
 }

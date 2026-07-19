@@ -1,5 +1,7 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -19,19 +21,43 @@ fn internal(e: String) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e)
 }
 
+/// Dashboard auth is on when both env vars are set; workers and webhooks
+/// are never behind it (they authenticate machines, not people — see the
+/// route split in `router`).
+fn dashboard_creds() -> Option<(String, String)> {
+    let user = std::env::var("DASHBOARD_USERNAME").ok().filter(|s| !s.is_empty())?;
+    let pass = std::env::var("DASHBOARD_PASSWORD").ok().filter(|s| !s.is_empty())?;
+    Some((user, pass))
+}
+
+async fn require_session(
+    State(store): State<SharedStore>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if dashboard_creds().is_none() {
+        return Ok(next.run(req).await);
+    }
+    let token = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !token.is_empty() && store.session_valid(token).await.map_err(internal)? {
+        return Ok(next.run(req).await);
+    }
+    Err((StatusCode::UNAUTHORIZED, "sign in required".to_string()))
+}
+
 pub fn router(store: SharedStore) -> Router {
-    let router = Router::new()
-        .route("/api/health", get(health))
+    // Everything the browser dashboard reads or triggers sits behind the
+    // login session; worker/executor/webhook traffic stays open so machines
+    // keep working without a password.
+    let dashboard = Router::new()
         .route("/api/workers", get(list_workers))
-        .route("/api/workers/register", post(register))
-        .route("/api/workers/heartbeat", post(heartbeat))
         .route("/api/pipelines/trigger", post(trigger_pipeline))
-        .route("/api/webhooks/forgejo", post(forgejo_webhook))
         .route("/api/jobs", get(list_jobs))
-        .route("/api/jobs/claim", post(claim_job))
-        .route("/api/jobs/{id}/report", post(report_job))
-        .route("/api/jobs/{id}/progress", post(job_progress))
-        .route("/api/jobs/{id}/artifacts", post(upload_artifacts).get(download_artifacts))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/jobs/{id}/logs", get(job_logs))
@@ -39,6 +65,20 @@ pub fn router(store: SharedStore) -> Router {
         .route("/api/repos/{name}", delete(delete_repo))
         .route("/api/repos/{name}/pipeline", get(pipeline_file))
         .route("/api/activity/calendar", get(calendar))
+        .route_layer(middleware::from_fn_with_state(store.clone(), require_session));
+
+    let router = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/login", post(login))
+        .route("/api/workers/register", post(register))
+        .route("/api/workers/heartbeat", post(heartbeat))
+        .route("/api/webhooks/forgejo", post(forgejo_webhook))
+        .route("/api/jobs/claim", post(claim_job))
+        .route("/api/jobs/{id}/report", post(report_job))
+        .route("/api/jobs/{id}/progress", post(job_progress))
+        .route("/api/jobs/{id}/artifacts", post(upload_artifacts).get(download_artifacts))
+        .merge(dashboard)
         // dashboard dev server runs on another origin (127.0.0.1:4173)
         .layer(CorsLayer::permissive())
         // artifact tarballs exceed axum's 2MB default body cap
@@ -65,6 +105,33 @@ async fn health(State(store): State<SharedStore>) -> Result<Json<HealthReport>, 
     Ok(Json(HealthReport { health: "Ok", online_workers }))
 }
 
+/// Tells the dashboard whether to show the login screen.
+async fn auth_status() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "required": dashboard_creds().is_some() }))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn login(
+    State(store): State<SharedStore>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some((user, pass)) = dashboard_creds() else {
+        // no creds configured — login is a no-op, hand out a token anyway
+        let token = store.create_session().await.map_err(internal)?;
+        return Ok(Json(serde_json::json!({ "token": token })));
+    };
+    if req.username != user || req.password != pass {
+        return Err((StatusCode::UNAUTHORIZED, "wrong username or password".to_string()));
+    }
+    let token = store.create_session().await.map_err(internal)?;
+    Ok(Json(serde_json::json!({ "token": token })))
+}
+
 async fn list_workers(State(store): State<SharedStore>) -> Result<Json<Vec<Worker>>, ApiError> {
     Ok(Json(store.list_workers().await.map_err(internal)?))
 }
@@ -74,10 +141,14 @@ async fn register(
     Json(req): Json<WorkerRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
     let worker_id = store
-        .register(&req.worker_name, req.worker_id.clone())
+        .register(&req.worker_name, req.worker_id.clone(), &req.tags)
         .await
         .map_err(internal)?;
-    println!("Worker {} registered as {worker_id}", req.worker_name);
+    println!(
+        "Worker {} registered as {worker_id}{}",
+        req.worker_name,
+        if req.tags.is_empty() { String::new() } else { format!(" (tags: {})", req.tags.join(", ")) }
+    );
     Ok(Json(RegisterResponse { worker_id }))
 }
 

@@ -21,8 +21,11 @@ fn executor_url() -> &'static str {
 
 /// The unique id minted by the coordinator on first registration survives
 /// restarts in this file, so a worker keeps its identity for life.
+/// WORKER_STATE_DIR points it at a mounted volume in containers, where the
+/// working directory is wiped on every rebuild.
 fn id_file(name: &str) -> String {
-    format!(".worker-id-{name}")
+    let dir = std::env::var("WORKER_STATE_DIR").unwrap_or_else(|_| ".".into());
+    format!("{}/.worker-id-{name}", dir.trim_end_matches('/'))
 }
 
 fn load_worker_id(name: &str) -> Option<String> {
@@ -38,7 +41,7 @@ fn save_worker_id(name: &str, id: &str) {
     }
 }
 
-pub async fn run(name: String, coordinator: Option<String>, executor: Option<String>) {
+pub async fn run(name: String, coordinator: Option<String>, executor: Option<String>, tags: Option<String>) {
     let coord = coordinator
         .or_else(|| std::env::var("COORDINATOR_URL").ok())
         .unwrap_or_else(|| "http://127.0.0.1:8080".into());
@@ -48,14 +51,32 @@ pub async fn run(name: String, coordinator: Option<String>, executor: Option<Str
     let _ = COORDINATOR.set(coord.trim_end_matches('/').to_string());
     let _ = EXECUTOR.set(exec.trim_end_matches('/').to_string());
 
-    let client = Client::new();
-    let worker_id = register(&client, &name).await;
-    println!("Worker '{name}' up — id {worker_id}, coordinator {}", coordinator_url());
+    // capability labels this machine advertises; pipeline jobs with
+    // `tags: [...]` only land on workers carrying all of them
+    let tags: Vec<String> = tags
+        .or_else(|| std::env::var("WORKER_TAGS").ok())
+        .unwrap_or_default()
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
 
-    let body = WorkerRequest { worker_name: name.clone(), worker_id: Some(worker_id) };
+    let client = Client::new();
+    let worker_id = register(&client, &name, &tags).await;
+    println!(
+        "Worker '{name}' up — id {worker_id}, coordinator {}{}",
+        coordinator_url(),
+        if tags.is_empty() { String::new() } else { format!(", tags [{}]", tags.join(", ")) }
+    );
+
+    let body = WorkerRequest { worker_name: name.clone(), worker_id: Some(worker_id), tags: tags.clone() };
 
     let hb_client = client.clone();
-    let hb_body = WorkerRequest { worker_name: body.worker_name.clone(), worker_id: body.worker_id.clone() };
+    let hb_body = WorkerRequest {
+        worker_name: body.worker_name.clone(),
+        worker_id: body.worker_id.clone(),
+        tags: tags.clone(),
+    };
     tokio::spawn(async move { heartbeat(&hb_client, &hb_body).await; });
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -69,9 +90,13 @@ pub async fn run(name: String, coordinator: Option<String>, executor: Option<Str
 
 /// Register until the coordinator answers; returns the (possibly newly
 /// minted) unique worker id.
-async fn register(client: &Client, name: &str) -> String {
+async fn register(client: &Client, name: &str, tags: &[String]) -> String {
     let endpoint = format!("{}/api/workers/register", coordinator_url());
-    let req = WorkerRequest { worker_name: name.to_string(), worker_id: load_worker_id(name) };
+    let req = WorkerRequest {
+        worker_name: name.to_string(),
+        worker_id: load_worker_id(name),
+        tags: tags.to_vec(),
+    };
 
     loop {
         match client.post(&endpoint).json(&req).send().await {

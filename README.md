@@ -95,12 +95,38 @@ Jobs claimed by that worker run as plain subprocesses on that machine, in a
 workspace cloned from the pushed commit; artifacts still travel through the
 coordinator, so `needs` works across machines.
 
+### Job placement (pins and tags)
+
 Machine-specific jobs (like `self-deploy`, which needs the server's docker
-socket) declare `env: WORKER_PIN: <worker name>` in actions.yml — they are
-queued only for that worker while it's online. Everything else lands in the
-global queue, first free worker wins. Note the API is unauthenticated:
-anyone who can reach the coordinator URL can register a worker and claim
-jobs.
+socket) pin themselves to one worker by name in actions.yml — either
+`worker: <name>` on the job or the equivalent `env: WORKER_PIN: <name>`.
+Pinned jobs are queued only for that worker while it's online.
+
+Heavy jobs that need a *class* of machine rather than one specific box use
+capability tags. Start capable workers with labels:
+
+    cargo run --release -- worker --name beefy-1 --tags heavy,docker
+
+(or `WORKER_TAGS=heavy,docker` in the environment), then mark the job:
+
+    build-release:
+      stage: build
+      image: rust:latest
+      tags: [heavy]
+      script: cargo build --release
+
+A tagged job only runs on an online worker carrying **all** of its tags
+(idle workers are preferred); if none is online it waits in the queue until
+one appears. Untagged jobs land in the global queue, first free worker wins.
+
+## Dashboard login
+
+Set both `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` in the coordinator's
+environment (see docker-compose.yml) and the dashboard shows a login screen;
+sessions live in Redis for 7 days. Worker, executor, and webhook endpoints
+are not affected — machines keep talking to the coordinator without a
+password, so anyone who can reach the coordinator URL can still register a
+worker and claim jobs.
 
 ## Pieces
 
