@@ -2737,3 +2737,59 @@ canvas.devgraph { display: block; width: 100%; height: 88px; }
 @media (prefers-reduced-motion: reduce) {
   .dag-edge.activeflow { animation: none; }
 }
+
+/* ---- run nav v2: wider rail, aligned durations, job tree ---- */
+
+.run-shell { grid-template-columns: 236px minmax(0, 1fr); }
+.snav-item .g { margin-top: 1px; }
+.snav-stage { margin-top: 2px; }
+.snav-stage .nname { font-weight: 600; }
+.snav-jobs {
+  margin: 1px 0 3px 19px;
+  padding-left: 7px;
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+}
+.snav-jobs .snav-sub { padding: 5px 8px; }
+.snav-sub .ncol { flex: 1; }
+.snav-sub .nrow { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.snav-sub .nrow .nname { flex: 1; }
+.snav-sub .nrow .ndur { margin-left: auto; flex: none; }
+@media (max-width: 900px) {
+  .snav-jobs { border-left: 0; margin-left: 0; padding-left: 0; flex-direction: row; flex-wrap: wrap; }
+  .snav-sub .ncmd { display: none; }
+}
+
+/* ---- highlighted pipeline yaml ---- */
+
+.yaml-card { padding: 16px 18px 14px; margin-bottom: 20px; }
+.yaml-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.yaml-card-head .yfile { font-size: 12.5px; font-weight: 650; }
+.yaml-pre.yaml-hl { max-height: none; padding: 12px 0; }
+.yline { display: block; min-height: 1.6em; }
+.yline:hover { background: oklch(0.215 0.008 110); }
+.ylnum {
+  display: inline-block;
+  width: 3.2em;
+  padding-right: 1.2em;
+  text-align: right;
+  color: oklch(0.42 0.01 110);
+  user-select: none;
+}
+.ycode { white-space: pre; }
+.y-key { color: oklch(0.82 0.12 118); font-weight: 600; }
+.y-val { color: var(--term-ink); }
+.y-str { color: oklch(0.8 0.11 145); }
+.y-num { color: oklch(0.82 0.12 85); }
+.y-bool { color: oklch(0.82 0.12 85); font-weight: 600; }
+.y-com { color: var(--term-muted); font-style: italic; }
+.y-dash { color: oklch(0.66 0.03 110); }
+.y-script { color: oklch(0.85 0.02 85); }
+.yaml-note { margin-top: 8px; font-size: 11.5px; color: var(--muted); font-family: var(--font-mono); }

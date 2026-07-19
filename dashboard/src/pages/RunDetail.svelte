@@ -6,6 +6,7 @@
   import StatusPill from '../lib/components/StatusPill.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
   import { classify, parseSteps, type LineKind } from '../lib/logsteps';
+  import { highlightYaml } from '../lib/yamlhl';
   import { now, startPolling } from '../lib/poll';
   import type { Job, JobStatus, LogLine, Run, Worker } from '../lib/types';
 
@@ -173,19 +174,19 @@
     setTimeout(() => (copied = false), 1200);
   }
 
-  // ---- pipeline YAML viewer -----------------------------------------------------
-  let showYaml = $state(false);
+  // ---- pipeline YAML viewer (its own nav view) -----------------------------------
   let yaml = $state<{ file: string; content: string } | null>(null);
   let yamlError = $state('');
   // string keys so the effect refires only when the run actually changes,
   // not on every poll's fresh run object
   const yamlRepo = $derived(run?.repo ?? null);
   const yamlFile = $derived(run && /\.ya?ml$/.test(run.pipeline_file) ? run.pipeline_file : null);
+  const yamlLines = $derived(yaml ? highlightYaml(yaml.content) : []);
 
   $effect(() => {
     const repo = yamlRepo;
     const file = yamlFile;
-    if (!showYaml || !repo) return;
+    if (view !== 'yaml' || !repo) return;
     yaml = null;
     yamlError = '';
     let cancelled = false;
@@ -383,12 +384,16 @@
     <button type="button" class="snav-item" class:active={view === 'overview'} onclick={() => (view = 'overview')}>
       <span class="g" aria-hidden="true">◈</span><span class="nname">Overview</span>
     </button>
+    <button type="button" class="snav-item" class:active={view === 'yaml'} onclick={() => { view = 'yaml'; jobSel = null; }}>
+      <span class="g" aria-hidden="true">☰</span><span class="nname">Pipeline file</span>
+      <span class="ndur">{run?.pipeline_file.split('/').pop() ?? ''}</span>
+    </button>
     <div class="snav-group">Stages</div>
     {#each stages as stage (stage)}
       {@const jobs = stageJobs(stage)}
       <button
         type="button"
-        class="snav-item"
+        class="snav-item snav-stage"
         class:active={view === stage && jobSel === null}
         onclick={() => selectStage(stage)}
       >
@@ -396,21 +401,26 @@
         <span class="nname">{stage}</span>
         <span class="ndur">{jobs.filter((j) => j.status === 'passed').length}/{jobs.length}</span>
       </button>
-      {#each jobs as j (j.id)}
-        <button
-          type="button"
-          class="snav-item snav-sub"
-          class:active={jobSel === j.id}
-          title="$ {j.command}"
-          onclick={() => selectJob(j)}
-        >
-          <span class="g {j.status}" aria-hidden="true">{GLYPH[j.status]}</span>
-          <span class="ncol">
-            <span class="nname">{j.name}{#if jobDur(j)}<span class="ndur"> · {jobDur(j)}</span>{/if}</span>
-            <span class="ncmd">$ {j.command}</span>
-          </span>
-        </button>
-      {/each}
+      <div class="snav-jobs">
+        {#each jobs as j (j.id)}
+          <button
+            type="button"
+            class="snav-item snav-sub"
+            class:active={jobSel === j.id}
+            title="$ {j.command}"
+            onclick={() => selectJob(j)}
+          >
+            <span class="g {j.status}" aria-hidden="true">{GLYPH[j.status]}</span>
+            <span class="ncol">
+              <span class="nrow">
+                <span class="nname">{j.name}</span>
+                <span class="ndur">{jobDur(j)}</span>
+              </span>
+              <span class="ncmd">$ {j.command}</span>
+            </span>
+          </button>
+        {/each}
+      </div>
     {/each}
   </nav>
 
@@ -438,11 +448,11 @@
             <button
               type="button"
               class="fname fname-btn"
-              title={run.repo ? `${run.pipeline_file} — click to ${showYaml ? 'hide' : 'view'} the file` : 'this run has no registered repo to fetch the file from'}
+              title={run.repo ? `${run.pipeline_file} — view the file` : 'this run has no registered repo to fetch the file from'}
               disabled={!run.repo}
-              onclick={() => (showYaml = !showYaml)}
+              onclick={() => (view = 'yaml')}
             >
-              {run.pipeline_file.split('/').pop()}{showYaml ? ' ▴' : ' ▾'}
+              {run.pipeline_file.split('/').pop()} →
             </button>
             <span class="fon">on: {run.trigger === 'webhook' ? 'push' : run.trigger}</span>
             <span class="zoom-ctrls">
@@ -452,21 +462,6 @@
               <button class="zoombtn fit" onclick={() => { pan = { x: 0, y: 0 }; scale = 1; }}>reset</button>
             </span>
           </div>
-          {#if showYaml}
-            <div class="yaml-view">
-              {#if yamlError}
-                <div class="empty">{yamlError}</div>
-              {:else if !yaml}
-                <div class="empty">fetching pipeline file…</div>
-              {:else}
-                <div class="yaml-head">
-                  <span class="mono">{yaml.file}</span>
-                  <span class="dim">current version on the repo — the run may have used an older commit</span>
-                </div>
-                <pre class="yaml-pre">{yaml.content}</pre>
-              {/if}
-            </div>
-          {/if}
           <div
             class="flow-canvas"
             class:grabbing={dragging !== null}
@@ -515,7 +510,11 @@
                     <span class="fbody">
                       <span class="fname2">{n.job.name}</span>
                       {#if n.job.status === 'failed'}
-                        <span class="fsub bad">failed at {fmtDur((n.job.finished_at ?? $now) - (n.job.started_at ?? $now))}</span>
+                        <span class="fsub bad">
+                          {n.job.started_at
+                            ? `failed at ${fmtDur((n.job.finished_at ?? $now) - n.job.started_at)}`
+                            : 'skipped — dependency failed'}
+                        </span>
                       {:else if n.job.status === 'pending'}
                         <span class="fsub">{n.job.needs?.length ? `waiting on ${n.job.needs.join(', ')}` : 'queued'}</span>
                       {:else if n.job.started_at}
@@ -552,6 +551,24 @@
             {/each}
           {:else}
             <div class="empty">No jobs have been assigned to a worker yet.</div>
+          {/if}
+        </div>
+      {:else if view === 'yaml'}
+        <div class="card yaml-card">
+          <div class="yaml-card-head">
+            <span class="glabel">Pipeline file</span>
+            <span class="mono yfile">{yaml?.file ?? run.pipeline_file}</span>
+            <span class="fon">defines this run's stages, jobs and placement</span>
+          </div>
+          {#if !run.repo}
+            <div class="empty">This run has no registered repo to fetch the file from.</div>
+          {:else if yamlError}
+            <div class="empty">{yamlError}</div>
+          {:else if !yaml}
+            <div class="empty">fetching pipeline file…</div>
+          {:else}
+            <pre class="yaml-pre yaml-hl">{#each yamlLines as toks, i (i)}<span class="yline"><span class="ylnum" aria-hidden="true">{i + 1}</span><span class="ycode">{#each toks as tk, ti (ti)}{#if tk.cls}<span class={tk.cls}>{tk.text}</span>{:else}{tk.text}{/if}{:else}{' '}{/each}</span></span>{/each}</pre>
+            <div class="yaml-note">current version on the repo — the run may have used an older commit</div>
           {/if}
         </div>
       {:else}
