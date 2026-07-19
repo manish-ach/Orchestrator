@@ -40,21 +40,77 @@ export const ENDPOINTS = {
   calendar: '/api/activity/calendar',
 } as const;
 
+// ---- auth -------------------------------------------------------------------
+// The coordinator requires a login when DASHBOARD_USERNAME/PASSWORD are set
+// in its env. The session token lives in localStorage; every request sends
+// it as a Bearer header. A 401 anywhere kicks the app back to the login
+// screen via the `dash:unauthorized` event App.svelte listens for.
+
+const TOKEN_KEY = 'dash.token';
+
+export const getToken = (): string | null => localStorage.getItem(TOKEN_KEY);
+export const clearToken = (): void => localStorage.removeItem(TOKEN_KEY);
+
+function authHeaders(): Record<string, string> {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function handleUnauthorized(res: Response): void {
+  if (res.status === 401 && MODE === 'live') {
+    clearToken();
+    window.dispatchEvent(new CustomEvent('dash:unauthorized'));
+  }
+}
+
+/** Does the coordinator want a login? Mock mode and dead coordinators don't. */
+export async function authRequired(): Promise<boolean> {
+  if (MODE !== 'live') return false;
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/status`, { headers: { Accept: 'application/json' } });
+    const body = (await res.json()) as { required?: boolean };
+    return !!body.required;
+  } catch {
+    return false; // unreachable coordinator — let the pages show their error banner
+  }
+}
+
+export async function login(username: string, password: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) {
+    const reason = await res.text().catch(() => '');
+    throw new Error(reason || 'login failed');
+  }
+  const { token } = (await res.json()) as { token: string };
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { headers: { Accept: 'application/json' } });
-  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { Accept: 'application/json', ...authHeaders() },
+  });
+  if (!res.ok) {
+    handleUnauthorized(res);
+    throw new Error(`${path} -> ${res.status}`);
+  }
   return res.json() as Promise<T>;
 }
 
 async function post<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    ...(body !== undefined && {
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
+    headers: {
+      ...authHeaders(),
+      ...(body !== undefined && { 'Content-Type': 'application/json' }),
+    },
+    ...(body !== undefined && { body: JSON.stringify(body) }),
   });
   if (!res.ok) {
+    handleUnauthorized(res);
     // the coordinator answers 4xx with a human-readable reason
     const reason = await res.text().catch(() => '');
     throw new Error(reason || `${path} -> ${res.status}`);
@@ -103,8 +159,12 @@ const liveApi: Api = {
   },
 
   async deleteRepo(name: string): Promise<void> {
-    const res = await fetch(`${API_BASE}${ENDPOINTS.repo(name)}`, { method: 'DELETE' });
+    const res = await fetch(`${API_BASE}${ENDPOINTS.repo(name)}`, {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
     if (!res.ok) {
+      handleUnauthorized(res);
       const reason = await res.text().catch(() => '');
       throw new Error(reason || `${ENDPOINTS.repo(name)} -> ${res.status}`);
     }

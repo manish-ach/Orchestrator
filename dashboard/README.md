@@ -69,6 +69,8 @@ the coordinator gets it (Postgres, memory, the Forgejo API) is its business.
 | Endpoint                      | Notes                                     |
 | ----------------------------- | ----------------------------------------- |
 | `GET  /api/health`            | `{ "health": "Ok", "online_workers": 5 }` |
+| `GET  /api/auth/status`       | `{ "required": true }` when the coordinator has `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` set |
+| `POST /api/auth/login`        | `{ "username", "password" }` → `{ "token" }`; the dashboard sends it as `Authorization: Bearer <token>` on every call below (workers/webhooks stay tokenless) |
 | `GET  /api/workers`           | see Worker below                          |
 | `GET  /api/jobs`              | flat job list across all runs             |
 | `POST /api/pipelines/trigger` | optional `{ "repo": "<name>" }` body — runs that repo's pipeline YAML (parsed by yaml-parser); without it, the local pipeline.yml. Returns `{ "id": <run id> }` |
@@ -137,12 +139,15 @@ utilization charts, per-stage stats, the monitor's fleet graph — no extra
 metrics endpoints are needed (and none should be invented: there is no
 CPU/RAM data in this system).
 
-**3. Workers** (`last_heartbeat` is ms epoch; state lives in Redis and
-`status` is computed from heartbeat age):
+**3. Workers** (`last_heartbeat`/`registered_at` are ms epoch; state lives
+in Redis and `status` is computed from heartbeat age; `tags` are the
+capability labels from `--tags`/`WORKER_TAGS`):
 
 ```jsonc
 // GET /api/workers → Worker[]
-{ "name": "rechek", "status": "online", "last_heartbeat": 1783240050000, "job_id": 7 }
+{ "id": "6f9c…", "name": "rechek", "status": "online",
+  "last_heartbeat": 1783240050000, "registered_at": 1783150000000,
+  "tags": ["heavy"], "job_id": 7 }
 ```
 
 **4. Repos.** The coordinator proxies Forgejo: repo info from
@@ -175,9 +180,9 @@ Missing fields degrade gracefully ("not configured" / "unknown" / "no data").
 ```
 
 **6. Trigger** is `POST /api/pipelines/trigger` with an optional
-`{ "repo": "<name>" }` body: the run page's "Retry run" passes the repo it
-is looking at, so the same repo's pipeline YAML is re-run. Unregistered
-names fall back to the local pipeline.yml, then a built-in default plan.
+`{ "repo": "<name>" }` body (the overview's "Trigger run" sends none).
+Unregistered names fall back to the local pipeline.yml, then a built-in
+default plan.
 
 ### Where the data lives
 

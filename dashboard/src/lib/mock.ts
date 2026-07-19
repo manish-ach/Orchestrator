@@ -420,6 +420,8 @@ function buildHistory() {
     name,
     status: i === 4 ? 'offline' : 'online',
     last_heartbeat: now - (i === 4 ? 220000 : 1000 + i * 700),
+    registered_at: now - (i + 2) * 5 * 3_600_000,
+    tags: i === 1 ? ['heavy', 'docker'] : [],
     job_id: null,
   }));
 

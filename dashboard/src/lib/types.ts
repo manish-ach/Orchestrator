@@ -28,6 +28,8 @@ export interface Job {
   /** declared artifact paths; uploaded to the coordinator when passed */
   artifacts?: string[];
   has_artifacts?: boolean;
+  /** worker capability labels this job requires (yml `tags:`) */
+  tags?: string[];
   /** mock-only: planned duration used by the simulator */
   planned?: number;
 }
@@ -52,6 +54,10 @@ export interface Worker {
   name: string;
   status: WorkerState;
   last_heartbeat: number;
+  /** ms epoch of first registration — used for the uptime readout */
+  registered_at?: number;
+  /** capability labels the worker advertised (--tags heavy,docker) */
+  tags?: string[];
   job_id: number | null;
 }
 

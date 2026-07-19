@@ -86,9 +86,9 @@
     return `${d.count} run${d.count === 1 ? '' : 's'} on ${MONTHS[date.getMonth()]} ${date.getDate()}`;
   }
 
-  // ---- updates feed (pipeline-file pushes only) -------------------------------
+  // ---- updates feed (every run; pipeline-file pushes get a file chip) ---------
   const isYml = (f: string) => /\.ya?ml$/i.test(f);
-  const feed = $derived(sorted.filter((r) => r.commit?.files?.some(isYml)).slice(0, 10));
+  const feed = $derived(sorted.slice(0, 10));
 
   function sentence(r: Run): { actor: string; html: string } {
     const author = r.commit ? r.commit.author : 'someone';
@@ -237,7 +237,7 @@
       <span class="glabel">Workers · 15m utilization</span>
       <div>
         {#if overview && act}
-          {#each overview.workers as w (w.name)}
+          {#each overview.workers as w (w.id ?? w.name)}
             {@const st = deviceStats(act.byWorker.get(w.name) ?? [], act)}
             {@const runningIv = (act.byWorker.get(w.name) ?? []).find((iv) => iv.status === 'running')}
             <div class="wrow" class:offline={w.status !== 'online'}>
@@ -258,12 +258,11 @@
     </section>
   </div>
 
-  <div class="section-label">Updates <span class="meta">pushes that touched a pipeline file (.yml / .yaml)</span></div>
+  <div class="section-label">Updates <span class="meta">latest pipeline runs — pushes touching a .yml / .yaml file are flagged</span></div>
   <section class="feed" aria-label="Updates">
     {#if !feed.length}
       <div class="empty">
-        No pipeline-file pushes yet — updates appear when a commit touches a
-        <code>.yml</code> / <code>.yaml</code> pipeline definition.
+        No runs yet — trigger one manually or push to a registered repo.
       </div>
     {/if}
     {#each feed as r (r.id)}
@@ -285,7 +284,9 @@
             <span class="fobj-l2">{r.commit?.message ?? '—'}</span>
           </span>
           <span class="fobj-side">
-            <span class="file-chip" title={ymlFile}>{ymlFile.split('/').pop()}</span>
+            {#if ymlFile}
+              <span class="file-chip" title={ymlFile}>{ymlFile.split('/').pop()}</span>
+            {/if}
             <span class="repo-tag">{r.repo ?? r.pipeline}</span>
             <Strip jobs={r.jobs} />
           </span>

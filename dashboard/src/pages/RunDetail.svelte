@@ -6,7 +6,6 @@
   import StatusPill from '../lib/components/StatusPill.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
   import { now, startPolling } from '../lib/poll';
-  import { navigate } from '../lib/router';
   import type { Job, JobStatus, LogLine, Run, Worker } from '../lib/types';
 
   let { id, initialJob = null }: { id: string; initialJob?: string | null } = $props();
@@ -19,7 +18,6 @@
   let logFollow = $state(true);
   let logWrap = $state(false);
   let log = $state<LogLine[]>([]);
-  let retrying = $state(false);
   // svelte-ignore state_referenced_locally — the deep link is consumed once, on purpose
   let deepLinkPending = initialJob !== null;
   let logBody = $state<HTMLElement | null>(null);
@@ -148,17 +146,6 @@
     setTimeout(() => (copied = false), 1200);
   }
 
-  async function retry() {
-    retrying = true;
-    try {
-      // retry with the same repo's pipeline when the run came from one
-      const { id: newId } = await api.trigger(run?.repo);
-      navigate(`/run/${newId}`);
-    } finally {
-      retrying = false;
-    }
-  }
-
   // ---- pipeline YAML viewer -----------------------------------------------------
   let showYaml = $state(false);
   let yaml = $state<{ file: string; content: string } | null>(null);
@@ -271,9 +258,6 @@
 </script>
 
 <Snackbar fallback="/">
-  {#snippet actions()}
-    <button class="btn btn-lime" onclick={retry} disabled={retrying}>Retry run</button>
-  {/snippet}
   {#if run}
     <StatusPill status={run.status} />
     <span class="stitle" title={run.commit?.message ?? ''}>{run.commit?.message ?? `Run #${run.id}`}</span>
@@ -316,7 +300,10 @@
           onclick={() => selectJob(j)}
         >
           <span class="g {j.status}" aria-hidden="true">{GLYPH[j.status]}</span>
-          <span class="nname">{j.name}</span>
+          <span class="ncol">
+            <span class="nname">{j.name}</span>
+            <span class="ncmd">$ {j.command}</span>
+          </span>
         </button>
       {/each}
     {/each}
