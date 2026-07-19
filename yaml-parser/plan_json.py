@@ -46,6 +46,8 @@ def plan_json(file_path: str) -> dict:
                 "env": pipeline.jobs[job_name].env,
                 "image": pipeline.jobs[job_name].image,
                 "artifacts": pipeline.jobs[job_name].artifacts,
+                "worker": pipeline.jobs[job_name].worker,
+                "tags": pipeline.jobs[job_name].tags,
             }
             for job_name in order
         ],
