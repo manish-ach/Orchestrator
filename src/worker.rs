@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use reqwest::Client;
-use crate::types::{ClaimedJob, JobStatus, RegisterResponse, ReportRequest, RunRequest, RunResponse, WorkerRequest};
+use crate::types::{ClaimedJob, JobStatus, RegisterResponse, ReportRequest, RunRequest, RunResponse, WorkerRequest, WorkerStats};
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 2;
 
@@ -69,13 +69,14 @@ pub async fn run(name: String, coordinator: Option<String>, executor: Option<Str
         if tags.is_empty() { String::new() } else { format!(", tags [{}]", tags.join(", ")) }
     );
 
-    let body = WorkerRequest { worker_name: name.clone(), worker_id: Some(worker_id), tags: tags.clone() };
+    let body = WorkerRequest { worker_name: name.clone(), worker_id: Some(worker_id), tags: tags.clone(), stats: None };
 
     let hb_client = client.clone();
     let hb_body = WorkerRequest {
         worker_name: body.worker_name.clone(),
         worker_id: body.worker_id.clone(),
         tags: tags.clone(),
+        stats: None,
     };
     tokio::spawn(async move { heartbeat(&hb_client, &hb_body).await; });
 
@@ -96,6 +97,7 @@ async fn register(client: &Client, name: &str, tags: &[String]) -> String {
         worker_name: name.to_string(),
         worker_id: load_worker_id(name),
         tags: tags.to_vec(),
+        stats: None,
     };
 
     loop {
@@ -113,12 +115,32 @@ async fn register(client: &Client, name: &str, tags: &[String]) -> String {
     }
 }
 
+/// Each heartbeat carries a fresh CPU/RAM sample, so the coordinator can
+/// keep an accurate per-device usage history for the dashboard graphs.
 async fn heartbeat(client: &Client, body: &WorkerRequest) {
     let endpoint = format!("{}/api/workers/heartbeat", coordinator_url());
+    let mut sys = sysinfo::System::new();
+    // prime the CPU counters — the first reading after new() is always 0
+    sys.refresh_cpu_usage();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     loop {
         ticker.tick().await;
-        if let Err(error) = client.post(&endpoint).json(body).send().await {
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        let total = sys.total_memory();
+        let used = sys.used_memory();
+        let beat = WorkerRequest {
+            worker_name: body.worker_name.clone(),
+            worker_id: body.worker_id.clone(),
+            tags: body.tags.clone(),
+            stats: Some(WorkerStats {
+                cpu_pct: sys.global_cpu_usage(),
+                mem_pct: if total > 0 { used as f32 / total as f32 * 100.0 } else { 0.0 },
+                mem_used_mb: used / (1024 * 1024),
+                mem_total_mb: total / (1024 * 1024),
+            }),
+        };
+        if let Err(error) = client.post(&endpoint).json(&beat).send().await {
             println!("Heartbeat failed: {error}");
         }
     }
