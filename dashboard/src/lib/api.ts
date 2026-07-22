@@ -8,7 +8,7 @@
 //   localStorage.setItem('dash.apiBase', 'http://vm:8080').
 
 import { mockApi } from './mock';
-import type { Api, CalendarDay, JobDetail, Overview, Repo, Run, Worker } from './types';
+import type { Api, CalendarDay, JobDetail, Overview, Repo, Run, Worker, WorkerStatsSeries } from './types';
 
 const qs = new URLSearchParams(location.search);
 if (qs.get('mode')) localStorage.setItem('dash.mode', qs.get('mode')!);
@@ -28,6 +28,7 @@ export const API_BASE =
 export const ENDPOINTS = {
   health: '/api/health',
   workers: '/api/workers',
+  workerStats: '/api/workers/stats',
   jobs: '/api/jobs',
   trigger: '/api/pipelines/trigger', // POST, optional { repo } body
   runs: '/api/runs',
@@ -176,6 +177,10 @@ const liveApi: Api = {
 
   async calendar(): Promise<CalendarDay[]> {
     return get<CalendarDay[]>(ENDPOINTS.calendar);
+  },
+
+  async workerStats(): Promise<WorkerStatsSeries[]> {
+    return get<WorkerStatsSeries[]>(ENDPOINTS.workerStats);
   },
 };
 

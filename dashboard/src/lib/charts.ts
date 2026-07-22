@@ -2,7 +2,7 @@
 // Activity at any instant is derived from job started/finished timestamps,
 // so history is exact and works after a reload — no sampling daemon.
 
-import type { Job, Run, Worker } from './types';
+import type { Job, Run, StatSample, Worker } from './types';
 
 export interface BusyInterval {
   start: number;
@@ -171,6 +171,69 @@ export function drawUtilChart(
     const mw = ctx.measureText(opts.midLabel).width;
     ctx.fillText(opts.midLabel, padL + cw / 2 - mw / 2, h - 4);
   }
+}
+
+/**
+ * Device-monitor line chart over real heartbeat samples: x is wall time in
+ * [t0, t1], y is 0–100%. Gaps longer than a few heartbeats break the line,
+ * so an offline stretch reads as missing data rather than a flat line.
+ */
+export function drawStatChart(
+  canvas: HTMLCanvasElement,
+  samples: StatSample[],
+  opts: { t0: number; t1: number; metric: 'cpu' | 'mem'; stroke: string; fill: string },
+): void {
+  const C = LIGHT;
+  const { ctx, w, h } = prep(canvas);
+  const padL = 34;
+  const padT = 6;
+  const padB = 6;
+  const cw = w - padL - 8;
+  const ch = h - padT - padB;
+  ctx.font = '9.5px ui-monospace, Menlo, Consolas, monospace';
+  ([[1, '100%'], [0.5, '50%'], [0, '0%']] as const).forEach(([f, label]) => {
+    const y = Math.round(padT + (1 - f) * ch) + 0.5;
+    ctx.strokeStyle = C.grid;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - 8, y);
+    ctx.stroke();
+    ctx.fillStyle = C.text;
+    ctx.fillText(label, 2, y + 3);
+  });
+
+  const span = Math.max(opts.t1 - opts.t0, 1);
+  const pts = samples.filter((s) => s.t >= opts.t0 - 4000 && s.t <= opts.t1 + 1000);
+  if (!pts.length) return;
+  const GAP_MS = 8000;
+
+  // one stroked+filled path per contiguous stretch of samples
+  let seg: StatSample[] = [];
+  const flush = () => {
+    if (seg.length < 2) { seg = []; return; }
+    const xy = seg.map((s) => ({
+      x: padL + ((s.t - opts.t0) / span) * cw,
+      y: padT + (1 - Math.min(s[opts.metric], 100) / 100) * ch,
+    }));
+    ctx.beginPath();
+    xy.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.strokeStyle = opts.stroke;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.lineTo(xy[xy.length - 1].x, padT + ch);
+    ctx.lineTo(xy[0].x, padT + ch);
+    ctx.closePath();
+    ctx.fillStyle = opts.fill;
+    ctx.fill();
+    seg = [];
+  };
+  for (const s of pts) {
+    if (seg.length && s.t - seg[seg.length - 1].t > GAP_MS) flush();
+    seg.push(s);
+  }
+  flush();
 }
 
 export interface SparkSlot {

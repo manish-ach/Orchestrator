@@ -50,6 +50,31 @@ export interface Run {
   jobs: Job[];
 }
 
+/** Machine stats a worker samples and ships with every heartbeat. */
+export interface WorkerStats {
+  /** whole-machine CPU usage, 0–100 */
+  cpu_pct: number;
+  /** used / total physical memory, 0–100 */
+  mem_pct: number;
+  mem_used_mb: number;
+  mem_total_mb: number;
+}
+
+/** One stored stats sample; `t` is ms epoch, cpu/mem are 0–100. */
+export interface StatSample {
+  t: number;
+  cpu: number;
+  mem: number;
+}
+
+/** GET /api/workers/stats — recent sample history of one worker. */
+export interface WorkerStatsSeries {
+  id: string;
+  name: string;
+  status: WorkerState;
+  samples: StatSample[];
+}
+
 export interface Worker {
   /** unique id minted at first registration */
   id?: string;
@@ -61,6 +86,8 @@ export interface Worker {
   /** capability labels the worker advertised (--tags heavy,docker) */
   tags?: string[];
   job_id: number | null;
+  /** latest machine stats from the heartbeat; absent until one arrives */
+  stats?: WorkerStats | null;
 }
 
 export interface Overview {
@@ -128,4 +155,6 @@ export interface Api {
   /** raw pipeline YAML for a repo, proxied through the coordinator */
   pipelineFile(repo: string, file?: string): Promise<{ file: string; content: string }>;
   calendar(): Promise<CalendarDay[]>;
+  /** rolling CPU/RAM history per worker, fed by heartbeats */
+  workerStats(): Promise<WorkerStatsSeries[]>;
 }
