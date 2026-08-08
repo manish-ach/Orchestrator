@@ -185,6 +185,22 @@ are not affected — machines keep talking to the coordinator without a
 password, so anyone who can reach the coordinator URL can still register a
 worker and claim jobs.
 
+## Starting fresh
+
+`scripts/reset.sh` wipes run history so the dashboard starts clean — runs, jobs,
+their captured logs, artifacts, the worker registry, webhook delivery records
+and schedule state. Run it from the stack directory on the server:
+
+    ./scripts/reset.sh              # keeps registered repositories
+    ./scripts/reset.sh --all        # also unregisters every repository
+
+It asks for confirmation (type `reset`) unless given `--yes`. Run ids restart at
+1 afterwards, and workers re-register within a few seconds.
+
+Deliberately **not** part of self-deploy: a push that silently deleted history
+would make every deploy destructive, and you would only find out the first time
+you wanted to look something up.
+
 ## Pieces
 
 | Directory           | What                                                      |

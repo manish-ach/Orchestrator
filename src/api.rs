@@ -39,13 +39,33 @@ async fn require_session(
     if dashboard_creds().is_none() {
         return Ok(next.run(req).await);
     }
-    let token = req
+    let header_token = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if !token.is_empty() && store.session_valid(token).await.map_err(internal)? {
+        .unwrap_or("")
+        .to_string();
+
+    // EventSource cannot set headers, so the log stream — and ONLY the log
+    // stream — also accepts the session token as a query parameter. Without
+    // this, turning on dashboard auth would silently downgrade live logs to
+    // polling. Kept to one path on purpose: tokens in URLs end up in access
+    // logs, and that is a cost worth paying once, not everywhere.
+    let query_token = if req.uri().path().ends_with("/logs/stream") {
+        req.uri()
+            .query()
+            .and_then(|q| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("token=").map(|v| v.to_string()))
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let token = if header_token.is_empty() { query_token } else { header_token };
+    if !token.is_empty() && store.session_valid(&token).await.map_err(internal)? {
         return Ok(next.run(req).await);
     }
     Err((StatusCode::UNAUTHORIZED, "sign in required".to_string()))

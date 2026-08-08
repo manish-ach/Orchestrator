@@ -35,9 +35,11 @@ services:
       ARTIFACTS_DIR: /app/artifacts
       # FORGEJO_TOKEN: <for private repos>
       # Set both to put the dashboard behind a login screen (workers and
-      # webhooks are unaffected):
-      # DASHBOARD_USERNAME: admin
-      # DASHBOARD_PASSWORD: change-me
+      # webhooks are unaffected). Read from the environment rather than written
+      # here, so the password lives in the server's .env — which is gitignored —
+      # instead of being committed. Unset on both = no login screen.
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
     volumes:
       - artifacts:/app/artifacts
     depends_on:
