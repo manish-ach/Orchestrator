@@ -1,26 +1,29 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { api, MODE } from '../lib/api';
-  import { activity, deviceStats } from '../lib/charts';
-  import Avatar from '../lib/components/Avatar.svelte';
+  import { api } from '../lib/api';
+  import AppShell from '../lib/components/AppShell.svelte';
+  import FleetChart from '../lib/components/FleetChart.svelte';
+  import FlowCanvas from '../lib/components/FlowCanvas.svelte';
+  import Sparkline from '../lib/components/Sparkline.svelte';
   import Strip from '../lib/components/Strip.svelte';
-  import Topbar from '../lib/components/Topbar.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
   import { now, startPolling } from '../lib/poll';
-  import type { CalendarDay, Overview, Run } from '../lib/types';
+  import type { Overview, Run, WorkerStatsSeries } from '../lib/types';
 
-  const WINDOW_MS = 15 * 60 * 1000;
-  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
+  // The control centre answers "is anything on fire, right now". Anything that
+  // needs history, a full list or a comparison belongs to the page that owns it,
+  // so there are deliberately no "view all" links here.
   let overview = $state<Overview | null>(null);
-  let calendar = $state<CalendarDay[]>([]);
+  let series = $state<WorkerStatsSeries[]>([]);
   let error = $state('');
+  let picked = $state<number | null>(null);
+  let pickerOpen = $state(false);
 
   const stop = startPolling(async () => {
     try {
-      const [o, cal] = await Promise.all([api.overview(), api.calendar()]);
+      const [o, s] = await Promise.all([api.overview(), api.workerStats()]);
       overview = o;
-      calendar = cal;
+      series = s;
       error = '';
     } catch (e) {
       error = `Cannot reach the data source (${(e as Error).message}). Retrying on the next poll.`;
@@ -28,261 +31,255 @@
   });
   onDestroy(stop);
 
-  const runs = $derived(overview?.runs ?? []);
-  const sorted = $derived([...runs].sort((a, b) => b.started_at - a.started_at));
-  const finished = $derived(sorted.filter((r) => r.finished_at).slice(0, 10));
-  const passedCount = $derived(finished.filter((r) => r.status === 'passed').length);
-  const running = $derived(runs.flatMap((r) => r.jobs).filter((j) => j.status === 'running'));
-  const activeRun = $derived(sorted.find((r) => r.status === 'running'));
-  const queued = $derived(activeRun ? activeRun.jobs.filter((j) => j.status === 'pending') : []);
-  const durs = $derived(finished.map((r) => runDuration(r)));
-  const worst = $derived(Math.max(...durs, 1));
-  const avgDur = $derived(durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null);
+  const runs = $derived([...(overview?.runs ?? [])].sort((a, b) => b.started_at - a.started_at));
+  const workers = $derived(overview?.workers ?? []);
+  const allJobs = $derived(runs.flatMap((r) => r.jobs));
+  const runDur = (r: Run) => (r.finished_at ?? $now) - r.started_at;
 
-  const act = $derived(overview ? activity(overview.runs, overview.workers, $now, WINDOW_MS) : null);
-
-  function runDuration(r: Run): number {
-    return (r.finished_at ?? Date.now()) - r.started_at;
-  }
-
-  // ---- contribution calendar ------------------------------------------------
-  const calTotal = $derived(calendar.reduce((s, d) => s + d.count, 0));
-  const weeks = $derived.by(() => {
-    if (!calendar.length) return [] as (CalendarDay | null)[][];
-    const first = new Date(calendar[0].date);
-    const cells: (CalendarDay | null)[] = new Array(first.getDay()).fill(null).concat(calendar);
-    const out: (CalendarDay | null)[][] = [];
-    for (let i = 0; i < cells.length; i += 7) {
-      const week = cells.slice(i, i + 7);
-      while (week.length < 7) week.push(null);
-      out.push(week);
-    }
-    return out;
-  });
-  const monthLabels = $derived.by(() => {
-    const labels: { left: number; label: string }[] = [];
-    let last = -1;
-    weeks.forEach((week, wi) => {
-      const firstDay = week.find(Boolean);
-      if (!firstDay) return;
-      const m = new Date(firstDay.date).getMonth();
-      if (m !== last) {
-        labels.push({ left: wi * 11, label: MONTHS[m] });
-        last = m;
-      }
+  // ---- KPI tiles --------------------------------------------------------
+  const finished = $derived(runs.filter((r) => r.finished_at).slice(0, 20));
+  const passed = $derived(finished.filter((r) => r.status === 'passed').length);
+  const successPct = $derived(finished.length ? Math.round((passed / finished.length) * 100) : null);
+  // running success rate across the window, so the sparkline shows a trend
+  // instead of repeating the headline number
+  const successTrend = $derived.by(() => {
+    const seq = [...finished].reverse();
+    return seq.map((_, i) => {
+      const upto = seq.slice(0, i + 1);
+      return (upto.filter((r) => r.status === 'passed').length / upto.length) * 100;
     });
-    return labels.slice(1);
   });
-  function calLevel(count: number): string {
-    if (count <= 0) return '';
-    if (count === 1) return 'l1';
-    if (count <= 3) return 'l2';
-    if (count <= 5) return 'l3';
-    return 'l4';
-  }
-  function calLabel(d: CalendarDay): string {
-    const date = new Date(d.date);
-    return `${d.count} run${d.count === 1 ? '' : 's'} on ${MONTHS[date.getMonth()]} ${date.getDate()}`;
-  }
+  const durations = $derived(finished.map(runDur).filter((d) => d > 0));
+  const sorted = $derived([...durations].sort((a, b) => a - b));
+  const median = $derived(sorted.length ? sorted[Math.floor(sorted.length / 2)] : null);
+  const p90 = $derived(sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))] : null);
+  const runningJobs = $derived(allJobs.filter((j) => j.status === 'running'));
+  const startOfDay = $derived(new Date(new Date($now).setHours(0, 0, 0, 0)).getTime());
+  const failedToday = $derived(runs.filter((r) => r.status === 'failed' && r.started_at >= startOfDay));
 
-  // ---- updates feed (every run; pipeline-file pushes get a file chip) ---------
-  const isYml = (f: string) => /\.ya?ml$/i.test(f);
-  const feed = $derived(sorted.slice(0, 10));
+  // ---- live pipeline picker --------------------------------------------
+  // Newest running by default, newest finished when the fleet is quiet — the
+  // panel should never be blank just because nothing happens to be executing.
+  const running = $derived(runs.filter((r) => r.status === 'running'));
+  const candidates = $derived([...running, ...runs.filter((r) => r.status !== 'running')].slice(0, 12));
+  const current = $derived(candidates.find((r) => r.id === picked) ?? running[0] ?? runs[0] ?? null);
 
-  function sentence(r: Run): { actor: string; html: string } {
-    const author = r.commit ? r.commit.author : 'someone';
-    if (r.trigger === 'schedule') {
-      return { actor: 'schedule', html: `<b>schedule</b> ran <b>${r.pipeline}</b> on ${r.repo}` };
-    }
-    if (r.trigger === 'manual') {
-      return { actor: author, html: `<b>${author}</b> triggered <b>${r.pipeline}</b> manually` };
-    }
-    return {
-      actor: author,
-      html: `<b>${author}</b> pushed <code>${r.commit?.sha ?? '?'}</code> to <b>${r.repo}</b>`,
-    };
+  function statsFor(name: string, key: 'cpu' | 'mem'): number[] {
+    return series.find((s) => s.name === name)?.samples.map((x) => x[key]) ?? [];
   }
-
-  function verb(r: Run): string {
-    if (r.status === 'running') {
-      const done = r.jobs.filter((j) => j.status === 'passed').length;
-      return `is running · ${done}/${r.jobs.length} jobs done`;
+  function jobOf(w: { job_id: number | null }) {
+    if (w.job_id === null) return null;
+    for (const r of runs) {
+      const j = r.jobs.find((x) => x.id === w.job_id);
+      if (j) return { job: j, run: r };
     }
-    if (r.status === 'failed') {
-      const bad = r.jobs.find((j) => j.status === 'failed');
-      return `<b class="bad">failed at ${bad?.name ?? '?'}</b> after ${fmtDur(runDuration(r))}`;
-    }
-    return `passed in <b>${fmtDur(runDuration(r))}</b>`;
+    return null;
   }
-
-  const repoCount = $derived(new Set(runs.map((r) => r.repo ?? r.pipeline)).size);
+  const recent = $derived(runs.slice(0, 4));
 </script>
 
-<Topbar active="overview" {overview}>
-  <div class="wrap">
-    <div class="page-head">
-      <h1>Overview</h1>
-      <span class="meta">
-        {repoCount} repos · {runs.length} runs · {runs.filter((r) => r.status === 'passed').length} passed
-      </span>
+<AppShell active="control" {overview}>
+  <div class="page-body">
+    {#if error}<div class="err-banner">{error}</div>{/if}
+
+    <div class="kpis">
+      <div class="kpi">
+        <span class="lbl">Success rate</span>
+        <div class="v"><span class="num">{successPct ?? '–'}</span><span class="u">%</span></div>
+        <div class="sub">{passed} of {finished.length} recent runs</div>
+        <Sparkline values={successTrend} tone="ok" />
+      </div>
+      <div class="kpi">
+        <span class="lbl">Median duration</span>
+        <div class="v"><span class="num">{median ? fmtDur(median) : '–'}</span></div>
+        <div class="sub">{p90 ? `p90 ${fmtDur(p90)}` : 'no finished runs yet'}</div>
+        <Sparkline values={[...durations].reverse()} tone="brand" />
+      </div>
+      <div class="kpi">
+        <span class="lbl">Running now</span>
+        <div class="v"><span class="num">{runningJobs.length}</span><span class="u">jobs</span></div>
+        <div class="sub">
+          {runningJobs.length ? runningJobs.slice(0, 2).map((j) => j.name).join(' · ') : 'cluster idle'}
+        </div>
+      </div>
+      <div class="kpi">
+        <span class="lbl">Failed today</span>
+        <div class="v"><span class="num">{failedToday.length}</span><span class="u">runs</span></div>
+        <div class="sub">
+          {failedToday.length
+            ? [...new Set(failedToday.map((r) => r.repo))].slice(0, 2).join(' · ')
+            : 'nothing failed today'}
+        </div>
+      </div>
     </div>
 
-    <div class="band-grid">
-      <div class="tile">
-        <span class="tlabel">Success rate · 10 runs</span>
-        <span class="tval">
-          {#if finished.length}{Math.round((passedCount / finished.length) * 100)}<span class="u">%</span>{:else}–{/if}
-        </span>
-        <span class="tsub">{passedCount} passed · {finished.length - passedCount} failed</span>
-        <span class="tviz sq-row" role="img" aria-label="Last 10 run outcomes">
-          {#each [...finished].reverse() as r (r.id)}
-            <span class="sq {r.status}" title="#{r.id} {r.status}"></span>
-          {/each}
-        </span>
-      </div>
-      <div class="tile">
-        <span class="tlabel">Active now</span>
-        <span class="tval">{running.length}<span class="u">running</span></span>
-        <span class="tsub">
-          {running.length ? running.slice(0, 2).map((j) => `${j.name}@${j.worker}`).join(' · ') : 'cluster idle'}
-        </span>
-        <span class="tviz sq-row" role="img" aria-label="Jobs running now">
-          {#each running as j (j.id)}<span class="sq running" title={j.name}></span>{/each}
-          {#if !running.length}<span class="sq"></span>{/if}
-        </span>
-      </div>
-      <div class="tile">
-        <span class="tlabel">Avg run duration</span>
-        <span class="tval">{avgDur ? fmtDur(avgDur) : '–'}</span>
-        <span class="tsub">
-          {durs.length ? `fastest ${fmtDur(Math.min(...durs))} · slowest ${fmtDur(worst)}` : ''}
-        </span>
-        <span class="tviz sbars" role="img" aria-label="Recent run durations">
-          {#each [...finished].reverse() as r (r.id)}
-            <i
-              class:failed={r.status === 'failed'}
-              style="height:{Math.max(10, Math.round((runDuration(r) / worst) * 100))}%"
-              title="#{r.id} {fmtDur(runDuration(r))}"
-            ></i>
-          {/each}
-        </span>
-      </div>
-      <div class="tile">
-        <span class="tlabel">Queue</span>
-        <span class="tval">{queued.length}<span class="u">jobs</span></span>
-        <span class="tsub">{activeRun ? `waiting in run #${activeRun.id}` : 'nothing waiting'}</span>
-        <span class="tviz sq-row" role="img" aria-label="Queued jobs">
-          {#each queued as j (j.id)}<span class="sq" title={j.name}></span>{/each}
-          {#if !queued.length}<span class="sq passed" title="queue empty"></span>{/if}
-        </span>
-      </div>
-    </div>
-  </div>
-</Topbar>
-
-<main class="wrap">
-  {#if error}<div class="err-banner">{error}</div>{/if}
-
-  <div class="dash-grid">
-    <section class="panel-graph" aria-label="Run activity, past year">
-      <div class="graph-head">
-        <span class="glabel">Run activity · past year</span>
-        <span class="gvalue">{calTotal} runs</span>
-      </div>
-      <div class="cal-scroll">
-        <div class="cal">
-          <div class="cal-months">
-            {#each monthLabels as m (m.left)}<span style="left:{m.left}px">{m.label}</span>{/each}
-          </div>
-          <div class="cal-body">
-            <div class="cal-dow"><span></span><span>mon</span><span></span><span>wed</span><span></span><span>fri</span><span></span></div>
-            <div class="cal-grid">
-              {#each weeks as week, wi (wi)}
-                <div class="cal-week">
-                  {#each week as d, di (di)}
-                    {#if d}
-                      <span class="cal-cell {calLevel(d.count)}" title={calLabel(d)} aria-label={calLabel(d)}></span>
-                    {:else}
-                      <span class="cal-cell future" aria-hidden="true"></span>
+    <div class="grid">
+      <section class="card flex">
+        <div class="chead">
+          {#if current}
+            <span class="g {current.status}">{GLYPH[current.status] ?? ''}</span>
+            <div class="picker">
+              <button class="pk-btn" aria-haspopup="listbox" aria-expanded={pickerOpen} onclick={() => (pickerOpen = !pickerOpen)}>
+                {current.repo} / {current.pipeline} <span class="id">#{current.id}</span>
+              </button>
+              {#if pickerOpen}
+                <div class="pk-menu">
+                  {#each ['running', 'finished'] as group (group)}
+                    {@const rows = candidates.filter((r) => (group === 'running' ? r.status === 'running' : r.status !== 'running'))}
+                    {#if rows.length}
+                      <div class="pk-lbl">{group === 'running' ? 'Running now' : 'Recently finished'}</div>
+                      {#each rows as r (r.id)}
+                        <button class="pk-opt" class:sel={r.id === current.id} onclick={() => { picked = r.id; pickerOpen = false; }}>
+                          <span class="g {r.status}">{GLYPH[r.status] ?? ''}</span>
+                          <span class="pk-txt">
+                            <span class="nm">{r.repo} / {r.pipeline} #{r.id}</span>
+                            <span class="sub">{r.commit?.message ?? '—'}</span>
+                          </span>
+                          <span class="agecol">{ago(r.started_at, $now)}</span>
+                        </button>
+                      {/each}
                     {/if}
                   {/each}
                 </div>
+              {/if}
+            </div>
+            <span class="m">{current.commit?.message ?? ''}</span>
+          {:else}
+            <h2>No runs yet</h2>
+          {/if}
+        </div>
+
+        {#if current}
+          <FlowCanvas
+            jobs={current.jobs}
+            height={286}
+            onselect={(j) => (location.hash = `/run/${current.id}?job=${j.id}`)}
+          />
+          <div class="wells">
+            <div class="well">
+              <span class="lbl">{current.status === 'running' ? 'Elapsed' : 'Duration'}</span>
+              <span class="v">{fmtDur(runDur(current))}</span>
+            </div>
+            <div class="well">
+              <span class="lbl">Jobs</span>
+              <span class="v">
+                {current.jobs.filter((j) => j.status === 'passed').length}<small
+                  >/{current.jobs.length} done · {current.jobs.filter((j) => j.status === 'failed').length} failed</small>
+              </span>
+            </div>
+            <div class="well">
+              <span class="lbl">Workers</span>
+              <span class="v">
+                {new Set(current.jobs.map((j) => j.worker).filter(Boolean)).size}<small>&nbsp;on this run</small>
+              </span>
+            </div>
+            <div class="well">
+              <span class="lbl">Triggered by</span>
+              <span class="v sm">
+                {current.trigger === 'webhook' ? 'push' : current.trigger}<small
+                  >{current.commit ? ` · ${current.commit.author}` : ''}</small>
+              </span>
+            </div>
+          </div>
+        {/if}
+      </section>
+
+      <section class="card">
+        <div class="chead">
+          <h2>Worker cluster</h2>
+          <span class="m">
+            {workers.filter((w) => w.status === 'online').length} online · {workers.filter((w) => w.status !== 'online').length} offline
+          </span>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th>Worker</th><th>Status</th><th>CPU</th><th>Memory</th><th>Current job</th></tr>
+            </thead>
+            <tbody>
+              {#each workers as w (w.id ?? w.name)}
+                {@const busy = jobOf(w)}
+                <tr class:offrow={w.status !== 'online'}>
+                  <td>
+                    <a class="wname" href="#/workers/{encodeURIComponent(w.name)}">{w.name}</a>
+                    <span class="whost">{(w.tags ?? []).join(' · ') || 'no tags'}</span>
+                  </td>
+                  <td>
+                    <span class="pill" class:on={w.status === 'online' && !busy} class:busy={!!busy} class:off={w.status !== 'online'}>
+                      <i></i>{w.status !== 'online' ? 'Offline' : busy ? 'Busy' : 'Idle'}
+                    </span>
+                  </td>
+                  <td>
+                    <span class="meter">
+                      <span class="spark-slot"><Sparkline values={statsFor(w.name, 'cpu')} tone="brand" width={40} height={18} /></span>
+                      <span class="num">{w.stats ? `${Math.round(w.stats.cpu_pct)}%` : '—'}</span>
+                    </span>
+                  </td>
+                  <td>
+                    <span class="meter">
+                      <span class="spark-slot"><Sparkline values={statsFor(w.name, 'mem')} tone="brand" width={40} height={18} /></span>
+                      <span class="num">{w.stats ? `${Math.round(w.stats.mem_pct)}%` : '—'}</span>
+                    </span>
+                  </td>
+                  <td class="job">
+                    {#if busy}
+                      <a href="#/run/{busy.run.id}?job={busy.job.id}">{busy.job.name}</a>
+                      <span class="s">{busy.run.pipeline} #{busy.run.id}</span>
+                    {:else if w.status !== 'online'}
+                      <span class="dead">no heartbeat for {ago(w.last_heartbeat, $now).replace(' ago', '')}</span>
+                    {:else}
+                      <span class="idle">standing by</span>
+                    {/if}
+                  </td>
+                </tr>
               {/each}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="grid b">
+      <section class="card">
+        <div class="chead"><h2>Recent runs</h2><span class="m">latest activity</span></div>
+        <div class="scroll">
+          {#each recent as r (r.id)}
+            <a class="run" href="#/run/{r.id}">
+              <span class="g {r.status}">{GLYPH[r.status] ?? ''}</span>
+              <span class="rbody">
+                <span class="t">{r.commit?.message ?? `Run #${r.id}`}</span>
+                <span class="s">{r.repo} #{r.id} · {r.commit?.sha ?? '—'} · {r.commit?.author ?? 'unknown'}</span>
+              </span>
+              <span class="rail2">
+                <Strip jobs={r.jobs} />
+                <span class="rt">
+                  <span class="b">{fmtDur(runDur(r))}</span>
+                  <span class="a">{r.status === 'running' ? 'running' : ago(r.started_at, $now)}</span>
+                </span>
+              </span>
+            </a>
+          {:else}
+            <div class="empty">No runs yet — push to a registered repo and its pipeline appears here.</div>
+          {/each}
+        </div>
+      </section>
+
+      <section class="card flex">
+        <div class="chead">
+          <h2>Fleet utilization</h2>
+          <div class="right">
+            <div class="legend">
+              <span><i style="background:oklch(0.66 0.09 112)"></i>in flight</span>
+              <span><i style="background:oklch(0.935 0.004 110)"></i>headroom</span>
+              <span><i style="background:oklch(0.74 0.15 62)"></i>queued</span>
+              <span><i class="rail" style="background:oklch(0.74 0.15 62)"></i>at capacity</span>
             </div>
           </div>
         </div>
-      </div>
-      <div class="cal-legend">
-        <span>less</span>
-        <span class="cal-cell"></span><span class="cal-cell l1"></span><span class="cal-cell l2"></span><span class="cal-cell l3"></span><span class="cal-cell l4"></span>
-        <span>more</span>
-      </div>
-    </section>
-
-    <section class="panel-workers" aria-label="Workers">
-      <span class="glabel">Workers · 15m utilization</span>
-      <div>
-        {#if overview && act}
-          {#each overview.workers as w (w.id ?? w.name)}
-            {@const st = deviceStats(act.byWorker.get(w.name) ?? [], act)}
-            {@const runningIv = (act.byWorker.get(w.name) ?? []).find((iv) => iv.status === 'running')}
-            <div class="wrow" class:offline={w.status !== 'online'}>
-              <span class="dot" aria-hidden="true"></span>
-              <span class="wname">{w.name}</span>
-              <span class="ubar"><i style="width:{st.util}%"></i></span>
-              {#if w.status !== 'online'}
-                <span class="upct">off {ago(w.last_heartbeat, $now).replace(' ago', '')}</span>
-              {:else if runningIv}
-                <span class="wjob"><a href="#/run/{runningIv.run.id}?job={runningIv.job.id}">{runningIv.job.name}</a></span>
-              {:else}
-                <span class="upct">{st.util}%</span>
-              {/if}
-            </div>
-          {/each}
-        {/if}
-      </div>
-    </section>
-  </div>
-
-  <div class="section-label">
-    Updates <span class="meta">latest pipeline runs — pushes touching a .yml / .yaml file are flagged</span>
-    <a class="seeall" href="#/runs">all runs →</a>
-  </div>
-  <section class="feed" aria-label="Updates">
-    {#if !feed.length}
-      <div class="empty">
-        No runs yet — push to a registered repo and its pipeline appears here.
-      </div>
-    {/if}
-    {#each feed as r (r.id)}
-      {@const s = sentence(r)}
-      {@const ymlFile = r.commit?.files.find(isYml) ?? ''}
-      <article class="fcard">
-        <div class="fcard-head">
-          <Avatar name={s.actor} />
-          <span class="sentence">{@html s.html}</span>
-          <span class="when">{ago(r.started_at, $now)}</span>
+        <div class="chartbox">
+          <FleetChart jobs={allJobs} {workers} now={$now} />
         </div>
-        <a class="fobj" href="#/run/{r.id}">
-          <span class="g {r.status}" aria-hidden="true">{GLYPH[r.status] ?? '·'}</span>
-          <span class="fobj-body">
-            <span class="fobj-l1">
-              <span class="rref">{r.pipeline} #{r.id}</span>
-              <span class="verb">{@html verb(r)}</span>
-            </span>
-            <span class="fobj-l2">{r.commit?.message ?? '—'}</span>
-          </span>
-          <span class="fobj-side">
-            {#if ymlFile}
-              <span class="file-chip" title={ymlFile}>{ymlFile.split('/').pop()}</span>
-            {/if}
-            <span class="repo-tag">{r.repo ?? r.pipeline}</span>
-            <Strip jobs={r.jobs} />
-          </span>
-        </a>
-      </article>
-    {/each}
-  </section>
-
-  <footer class="foot">mode: {MODE} · polling every 3s · coordinator http://127.0.0.1:8080</footer>
-</main>
+      </section>
+    </div>
+  </div>
+</AppShell>

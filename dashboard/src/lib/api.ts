@@ -8,7 +8,17 @@
 //   localStorage.setItem('dash.apiBase', 'http://vm:8080').
 
 import { mockApi } from './mock';
-import type { Api, CalendarDay, JobDetail, Overview, Repo, Run, Worker, WorkerStatsSeries } from './types';
+import type {
+  Api,
+  Insights,
+  JobDetail,
+  Overview,
+  Repo,
+  Run,
+  Worker,
+  WorkerActivity,
+  WorkerStatsSeries,
+} from './types';
 
 const qs = new URLSearchParams(location.search);
 if (qs.get('mode')) localStorage.setItem('dash.mode', qs.get('mode')!);
@@ -29,16 +39,18 @@ export const ENDPOINTS = {
   health: '/api/health',
   workers: '/api/workers',
   workerStats: '/api/workers/stats',
+  workerActivity: (name: string) => `/api/workers/${encodeURIComponent(name)}/activity`,
   jobs: '/api/jobs',
   trigger: '/api/pipelines/trigger', // POST, optional { repo } body
   runs: '/api/runs',
   run: (id: number | string) => `/api/runs/${id}`,
   jobLogs: (id: number | string) => `/api/jobs/${id}/logs`,
+  jobLogStream: (id: number | string) => `/api/jobs/${id}/logs/stream`,
   repos: '/api/repos', // GET = list, POST { remote } = register a Forgejo repo
   repo: (name: string) => `/api/repos/${encodeURIComponent(name)}`, // DELETE = unregister
   repoPipeline: (name: string, file?: string) =>
     `/api/repos/${encodeURIComponent(name)}/pipeline${file ? `?file=${encodeURIComponent(file)}` : ''}`,
-  calendar: '/api/activity/calendar',
+  insights: (days: number) => `/api/insights?range=${days}`,
 } as const;
 
 // ---- auth -------------------------------------------------------------------
@@ -147,6 +159,9 @@ const liveApi: Api = {
     return { run, job, log: raw.split('\n').map((t) => ({ t, err: false, ok: false })) };
   },
 
+  // No button calls this, and that is deliberate: the dashboard is read-only,
+  // so runs come from webhooks or curl. It stays because it is the endpoint the
+  // empty states teach, and because a UI that could start runs would need it.
   async trigger(repo?: string) {
     return post<{ id: number }>(ENDPOINTS.trigger, repo ? { repo } : undefined);
   },
@@ -175,12 +190,16 @@ const liveApi: Api = {
     return get(ENDPOINTS.repoPipeline(repo, file));
   },
 
-  async calendar(): Promise<CalendarDay[]> {
-    return get<CalendarDay[]>(ENDPOINTS.calendar);
-  },
-
   async workerStats(): Promise<WorkerStatsSeries[]> {
     return get<WorkerStatsSeries[]>(ENDPOINTS.workerStats);
+  },
+
+  async workerActivity(name: string): Promise<WorkerActivity> {
+    return get<WorkerActivity>(ENDPOINTS.workerActivity(name));
+  },
+
+  async insights(days: number): Promise<Insights> {
+    return get<Insights>(ENDPOINTS.insights(days));
   },
 };
 

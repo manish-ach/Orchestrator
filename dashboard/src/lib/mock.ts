@@ -2,7 +2,8 @@
 // including one run that progresses in real time while the page polls.
 
 import type {
-  Api, CalendarDay, Commit, Job, JobDetail, LogLine, Overview, Repo, Run, StatSample, Trigger, Worker,
+  Api, CalendarDay, Commit, DeviceProfile, FailureCause, FlakyJob, Insights, Job, JobDetail, JobSkew, LogLine,
+  Overview, Repo, Run, StageCost, StatSample, TrendPoint, Trigger, WaitPoint, Worker, WorkerActivity, WorkerJob,
   WorkerStatsSeries,
 } from './types';
 
@@ -13,6 +14,112 @@ interface Persisted { epoch: number; extra: { start: number; commit: Commit }[] 
 
 
 const WORKERS: string[] = ['rechek', 'nimesh-tp', 'prabhat-hp', 'rohan-mac', 'lab-05'];
+
+// The fleet is deliberately heterogeneous — this project runs on whatever
+// machines are around, and the device page exists to make that legible. Each
+// entry is what `orchestrator worker` reports from that kind of box.
+const DEVICES: Record<string, DeviceProfile> = {
+  rechek: {
+    os: 'Debian GNU/Linux 12 (bookworm)',
+    os_id: 'debian',
+    kernel: '6.1.0-28-arm64',
+    host: 'nxtcloud-m',
+    arch: 'aarch64',
+    cpu: 'Ampere Altra',
+    cpu_cores: 4,
+    cpu_physical: 4,
+    cpu_mhz: 3000,
+    mem_total_mb: 8192,
+    disk_total_gb: 160,
+    disk_free_gb: 96,
+    shell: '/bin/bash',
+    agent: '0.1.0',
+    executor: 'local',
+  },
+  'nimesh-tp': {
+    os: 'Arch Linux',
+    os_id: 'arch',
+    kernel: '6.12.4-arch1-1',
+    host: 'thinkpad-x1',
+    arch: 'x86_64',
+    cpu: 'Intel Core i7-1165G7',
+    cpu_cores: 8,
+    cpu_physical: 4,
+    cpu_mhz: 2800,
+    mem_total_mb: 16384,
+    disk_total_gb: 512,
+    disk_free_gb: 188,
+    shell: '/usr/bin/fish',
+    agent: '0.1.0',
+    executor: 'local',
+  },
+  'prabhat-hp': {
+    os: 'Windows 11 Pro 23H2',
+    os_id: 'windows',
+    kernel: '10.0.22631',
+    host: 'DESKTOP-4KQ2R1',
+    arch: 'x86_64',
+    cpu: 'AMD Ryzen 5 5600H',
+    cpu_cores: 12,
+    cpu_physical: 6,
+    cpu_mhz: 3300,
+    mem_total_mb: 16384,
+    disk_total_gb: 476,
+    disk_free_gb: 61,
+    shell: 'C:\\WINDOWS\\system32\\cmd.exe',
+    agent: '0.1.0',
+    executor: 'local',
+  },
+  'rohan-mac': {
+    os: 'macOS 15.5',
+    os_id: 'macos',
+    kernel: '24.5.0',
+    host: 'rohans-MacBook-Air.local',
+    arch: 'arm64',
+    cpu: 'Apple M2',
+    cpu_cores: 8,
+    cpu_physical: 8,
+    cpu_mhz: 3490,
+    mem_total_mb: 16384,
+    disk_total_gb: 460,
+    disk_free_gb: 233,
+    shell: '/bin/zsh',
+    agent: '0.1.0',
+    executor: 'local',
+  },
+  'lab-05': {
+    os: 'Ubuntu 24.04.1 LTS',
+    os_id: 'ubuntu',
+    kernel: '6.8.0-45-generic',
+    host: 'lab-05',
+    arch: 'x86_64',
+    cpu: 'Intel Core i5-8500',
+    cpu_cores: 6,
+    cpu_physical: 6,
+    cpu_mhz: 3000,
+    mem_total_mb: 8192,
+    disk_total_gb: 238,
+    disk_free_gb: 12,
+    shell: '/bin/bash',
+    // the one machine whose executor is not beside it, so the page has a
+    // reason to show the field at all
+    executor: 'http://10.0.4.31:9000',
+    agent: '0.1.0',
+  },
+};
+
+// Webhook delivery state, deliberately covering all three cases the panel
+// exists to distinguish: healthy, wired-up-but-rejected, and never delivered.
+const WEBHOOKS: Record<string, { last_at: number; event: string | null; status: string; detail: string | null }> = {
+  'CI-CD-orchestrator': { last_at: Date.now() - 9 * 60000, event: 'push', status: 'accepted', detail: null },
+  'command-executor': {
+    last_at: Date.now() - 3 * 3600000,
+    event: 'push',
+    status: 'rejected',
+    detail: 'repo has no pipeline file on main — add .orchestrator/actions.yml',
+  },
+  // yaml-parser deliberately absent: never delivered
+};
 
 // Forgejo repos. Each repo owns one or more pipelines (workflows).
 const REPOS = {
@@ -100,6 +207,18 @@ const PIPELINES: Record<string, PipelineDef> = {
     commits: [
       { sha: '6ad0327', message: 'nightly end-to-end on lab cluster', author: 'schedule', files: [] },
     ],
+  },
+  // Declared but never run: the state the repo page has to handle without
+  // inventing history — its shape comes from the definition index, not a run.
+  'orchestrator-release': {
+    repo: 'CI-CD-orchestrator',
+    file: '.orchestrator/release.yml',
+    plan: [
+      { stage: 'build',   name: 'cross-compile', command: 'cargo build --release --target aarch64-unknown-linux-gnu', dur: 96000 },
+      { stage: 'package', name: 'image',         command: 'docker buildx build --platform linux/arm64 .',            dur: 74000 },
+      { stage: 'publish', name: 'push',          command: './scripts/push-image.sh',                                  dur: 18000 },
+    ],
+    commits: [],
   },
   'yaml-parser-ci': {
     repo: 'yaml-parser',
@@ -341,6 +460,8 @@ function makeJobs(runId: number, rand: () => number, plan: PlanStep[]): Job[] {
     command: p.command,
     status: 'pending',
     worker: null,
+    ready_at: null,
+    requeue_count: 0,
     started_at: null,
     finished_at: null,
     exit_code: null,
@@ -368,20 +489,31 @@ function buildHistory() {
       const stageJobs = jobs.filter((j) => j.stage === stage);
       if (failedStage) { continue; }
       let stageEnd = cursor;
-      for (const j of stageJobs) {
+      // the stage becomes runnable at `cursor`; a job starts once a worker picks
+      // it up. Jobs beyond the fleet size queue behind the ones before them, so
+      // the wait grows with stage width — which is the effect the queue-vs-execute
+      // analysis is meant to surface.
+      stageJobs.forEach((j, k) => {
         j.worker = WORKERS[Math.floor(rand() * WORKERS.length)];
-        j.started_at = cursor + Math.round(rand() * 2000);
-        j.finished_at = j.started_at + j.planned!;
+        j.ready_at = cursor;
+        const backlog = Math.max(0, k - (WORKERS.length - 1));
+        const startedAt = cursor + Math.round(rand() * 900) + backlog * 4200;
+        j.started_at = startedAt;
+        j.finished_at = startedAt + j.planned!;
         stageEnd = Math.max(stageEnd, j.finished_at);
         if (spec.fail && j.name === spec.fail) {
           j.status = 'failed';
           j.exit_code = j.name === 'compile' ? 101 : 1;
+          j.first_error =
+            j.exit_code === 101
+              ? `error[E0308]: mismatched types --> src/${j.name}.rs:42`
+              : `error: ${j.name} exited with status ${j.exit_code}`;
           failedStage = stage;
         } else {
           j.status = 'passed';
           j.exit_code = 0;
         }
-      }
+      });
       cursor = stageEnd + 500;
     }
     const done = jobs.filter((j) => j.finished_at);
@@ -390,6 +522,7 @@ function buildHistory() {
       pipeline: spec.pipe,
       repo: pipeline.repo,
       pipeline_file: pipeline.file,
+      branch: REPOS[pipeline.repo as keyof typeof REPOS]?.branch ?? 'main',
       trigger: spec.trigger ?? (id % 3 === 2 ? 'manual' : 'webhook'),
       commit: pipeline.commits[idx % pipeline.commits.length],
       status: spec.fail ? 'failed' : 'passed',
@@ -408,6 +541,7 @@ function buildHistory() {
     pipeline: 'orchestrator-ci',
     repo: pipe.repo,
     pipeline_file: pipe.file,
+    branch: 'main',
     trigger: 'webhook',
     commit: pipe.commits[5],
     status: 'running',
@@ -424,6 +558,7 @@ function buildHistory() {
     registered_at: now - (i + 2) * 5 * 3_600_000,
     tags: i === 1 ? ['heavy', 'docker'] : [],
     job_id: null,
+    device: DEVICES[name] ?? null,
   }));
 
   // rehydrate runs triggered from the dashboard in this browser session
@@ -440,6 +575,7 @@ function addTriggeredRun(start: number, commit: Commit): number {
     pipeline: 'orchestrator-ci',
     repo: 'CI-CD-orchestrator',
     pipeline_file: '.orchestrator/ci.yml',
+    branch: 'main',
     trigger: 'manual',
     commit,
     status: 'running',
@@ -465,7 +601,10 @@ function tick() {
       const online = state.workers.filter((w) => w.status === 'online');
       stageJobs.forEach((j, k) => {
         if (j.started_at === null) {
-          j.started_at = cursor + 400 + k * 900;
+          // runnable as soon as the stage opens; started once a worker frees up
+          j.ready_at = cursor;
+          const backlog = Math.max(0, k - (online.length - 1));
+          j.started_at = cursor + 400 + k * 900 + backlog * 3500;
           j.worker = online[(j.id + k) % online.length].name;
         }
         if (now >= j.started_at! + j.planned!) {
@@ -614,23 +753,245 @@ function buildCalendar(): CalendarDay[] {
   return days;
 }
 
+// Jobs the simulator has actually placed on a machine — the only part of a
+// worker's history that is real in mock mode.
+function jobsOn(name: string): WorkerJob[] {
+  const out: WorkerJob[] = [];
+  for (const r of state.runs) {
+    for (const j of r.jobs) {
+      if (j.worker !== name || j.started_at === null) continue;
+      out.push({
+        job_id: j.id,
+        run_id: r.id,
+        repo: r.repo,
+        pipeline: r.pipeline,
+        stage: j.stage,
+        name: j.name,
+        status: j.status,
+        started_at: j.started_at,
+        finished_at: j.finished_at,
+      });
+    }
+  }
+  return out.sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0));
+}
+
+/**
+ * A year of daily job counts for one machine. Days inside the simulator's own
+ * window use its real placements; earlier days get a seeded pattern so the
+ * calendar has something to show. Seeded by worker name, so each device has
+ * its own shape and two machines never look like copies of each other.
+ */
+function buildWorkerCalendar(name: string, jobs: WorkerJob[]): CalendarDay[] {
+  const real: Record<string, number> = {};
+  for (const j of jobs) {
+    const k = dayKey(j.started_at!);
+    real[k] = (real[k] || 0) + 1;
+  }
+  // an offline machine stopped being given work — its calendar has to end
+  const stopped = state.workers.find((w) => w.name === name && w.status === 'offline')?.last_heartbeat ?? Infinity;
+
+  let seed = 0;
+  for (const c of name) seed = (seed * 31 + c.charCodeAt(0)) | 0;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days: CalendarDay[] = [];
+  for (let i = 363; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000);
+    const k = dayKey(d.getTime());
+    let count = 0;
+    if (i < PROJECT_AGE_DAYS && d.getTime() <= stopped) {
+      let h = seed;
+      for (const c of k) h = (h * 31 + c.charCodeAt(0)) | 0;
+      const roll = rng(h)();
+      const dow = d.getDay();
+      const weekend = dow === 0 || dow === 6;
+      if (roll < (weekend ? 0.2 : 0.62)) count = 1 + Math.floor(rng(h + 1)() * (weekend ? 3 : 9));
+    }
+    if (real[k] != null) count = real[k];
+    days.push({ date: k, count });
+  }
+  return days;
+}
+
+// ---- simulated insights -----------------------------------------------------
+// The simulator holds a few hours of runs; Insights asks about weeks. Rather
+// than extrapolate wildly from 13 runs, this builds a seeded history from the
+// same pipeline plans, workers and failure logs the rest of the mock uses, so
+// every number is at least internally consistent with what the site shows
+// elsewhere. It is stable across reloads because the seed is the day, not the
+// clock.
+
+const DAY_MS = 86400000;
+
+function insightsSeed(): number {
+  return Math.floor(Date.now() / DAY_MS);
+}
+
+/** Every plan step in the mock, flattened with its pipeline and repo. */
+function allSteps(): { pipe: string; repo: string; stage: string; name: string; dur: number }[] {
+  return Object.entries(PIPELINES).flatMap(([pipe, p]) =>
+    p.plan.map((s) => ({ pipe, repo: p.repo, stage: s.stage, name: s.name, dur: s.dur })),
+  );
+}
+
+function mockStages(): StageCost[] {
+  const steps = allSteps();
+  const byStage = new Map<string, { names: Set<string>; wall: number; runs: number }>();
+  for (const s of steps) {
+    const e = byStage.get(s.stage) ?? { names: new Set(), wall: 0, runs: 0 };
+    e.names.add(s.name);
+    // jobs in a stage run in parallel, so the stage costs its slowest job
+    e.wall = Math.max(e.wall, s.dur);
+    e.runs++;
+    byStage.set(s.stage, e);
+  }
+  return [...byStage.entries()]
+    .map(([stage, e]) => ({
+      stage,
+      jobs: e.names.size,
+      median_ms: e.wall,
+      p90_ms: Math.round(e.wall * 1.32),
+      runs: e.runs * 9,
+    }))
+    .sort((a, b) => b.median_ms - a.median_ms);
+}
+
+function mockFlaky(): FlakyJob[] {
+  const rand = rng(insightsSeed() * 31);
+  // the jobs the mock already shows failing intermittently
+  const picks: [string, string, number][] = [
+    ['chaos-kill-worker', 'CI-CD-orchestrator', 4],
+    ['api-tests', 'command-executor', 2],
+    ['unit-tests', 'CI-CD-orchestrator', 1],
+  ];
+  return picks.map(([name, repo, flips]) => {
+    // the strip must show at least as many failures as there were flips, or it
+    // contradicts the count printed beside it
+    const marks = Array.from({ length: 20 }, () => 'p');
+    for (let placed = 0; placed < flips + 1; ) {
+      const i = Math.floor(rand() * marks.length);
+      if (marks[i] === 'p') {
+        marks[i] = 'f';
+        placed++;
+      }
+    }
+    return { name, repo, flips, recent: marks.join('') };
+  });
+}
+
+function mockTrend(days: number): TrendPoint[] {
+  const rand = rng(insightsSeed() * 977 + days);
+  const out: TrendPoint[] = [];
+  const base = 92000;
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * DAY_MS);
+    const dow = d.getDay();
+    if (dow === 0 || dow === 6) {
+      // weekends are genuinely quiet in this fleet; a day with no run has no
+      // duration, so it is omitted rather than plotted as zero
+      if (rand() < 0.7) continue;
+    }
+    // p50 drifts down slowly, p90 drifts up — the shape the takeaway describes
+    const p50 = Math.round(base - (days - i) * 260 + (rand() - 0.5) * 14000);
+    const p90 = Math.round(p50 * (1.45 + ((days - i) / days) * 0.5) + (rand() - 0.5) * 12000);
+    out.push({
+      date: dayKey(d.getTime()),
+      runs: 2 + Math.floor(rand() * 7),
+      p50_ms: Math.max(20000, p50),
+      p90_ms: Math.max(30000, p90),
+    });
+  }
+  return out;
+}
+
+function mockWait(days: number): WaitPoint[] {
+  const rand = rng(insightsSeed() * 613 + days);
+  const span = Math.min(days, 14);
+  const out: WaitPoint[] = [];
+  for (let i = span - 1; i >= 0; i--) {
+    const d = new Date(Date.now() - i * DAY_MS);
+    const exec = Math.round(600000 + rand() * 900000);
+    // a couple of days where the queue, not the machines, is the bottleneck
+    const busy = rand() < 0.25;
+    out.push({
+      date: dayKey(d.getTime()),
+      wait_ms: Math.round(exec * (busy ? 0.45 + rand() * 0.2 : 0.04 + rand() * 0.08)),
+      exec_ms: exec,
+    });
+  }
+  return out;
+}
+
+function mockSkew(): JobSkew {
+  const rand = rng(insightsSeed() * 449);
+  // the same job on every machine — the comparison the panel exists to make
+  const workers = WORKERS.map((w) => {
+    const d = DEVICES[w];
+    // cores and clock are the honest reason one box is faster than another
+    const power = ((d?.cpu_cores ?? 4) / 8) * ((d?.cpu_mhz ?? 3000) / 3000);
+    return {
+      worker: w,
+      runs: 8 + Math.floor(rand() * 34),
+      median_ms: Math.round(46000 / Math.max(0.35, power) + rand() * 6000),
+      pass_pct: 92 + Math.floor(rand() * 9),
+    };
+  });
+  workers.sort((a, b) => a.median_ms - b.median_ms);
+  return { job: 'unit-tests', workers };
+}
+
+function mockCauses(): FailureCause[] {
+  const rand = rng(insightsSeed() * 89);
+  // the first line of each failure log the mock already serves, so a cause on
+  // this page matches the log you get when you open the run
+  const picks: [string, string, number][] = [
+    ['ERROR: e2e-w3 still marked online after 10s', 'chaos-kill-worker', 124],
+    ['E   AssertionError: subprocess still alive after cancel', 'api-tests', 1],
+    ['error[E0382]: borrow of moved value: `worker_name`', 'compile', 101],
+    ['error: unused variable: `worker_id`, -D warnings', 'clippy', 2],
+  ];
+  return picks
+    .map(([cause, job, exit_code], i) => ({
+      cause,
+      job,
+      exit_code,
+      count: Math.max(1, Math.round((18 - i * 5) * (0.7 + rand() * 0.6))),
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
 // Repos registered through the + Add repo form while in mock mode.
 const addedRepos: Repo[] = [];
 // Repos removed via delete while in mock mode.
 const deletedRepos = new Set<string>();
 
 export const mockApi: Api = {
-  async calendar(): Promise<CalendarDay[]> {
-    tick();
-    return buildCalendar();
-  },
   async repos(): Promise<Repo[]> {
     const builtin = Object.entries(REPOS).map(([name, r]) => ({
       name,
       ...r,
       pipelines: Object.entries(PIPELINES)
         .filter(([, p]) => p.repo === name)
-        .map(([pname, p]) => ({ name: pname, file: p.file })),
+        .map(([pname, p]) => ({
+          name: pname,
+          file: p.file,
+          // the shape the coordinator now indexes at discovery, so a pipeline
+          // has a known shape before it has ever run
+          stages: [...new Set(p.plan.map((s) => s.stage))],
+          jobs: p.plan.map((s, i) => ({
+            name: s.name,
+            stage: s.stage,
+            // each stage depends on the one before it, which is what these
+            // demo pipelines actually declare
+            needs: i > 0 && p.plan[i - 1].stage !== s.stage ? [p.plan[i - 1].name] : [],
+            tags: s.name === 'package' ? ['docker'] : [],
+          })),
+          parse_error: null,
+          schedule: pname.endsWith('-nightly') ? '0 2 * * *' : pname.endsWith('-release') ? '0 4 * * 1' : null,
+        })),
+      webhook: WEBHOOKS[name] ?? null,
     }));
     return [...builtin, ...addedRepos].filter((r) => !deletedRepos.has(r.name));
   },
@@ -703,6 +1064,54 @@ export const mockApi: Api = {
       samples: structuredClone(statWalks.get(w.name)?.samples ?? []),
     }));
   },
+  async insights(days: number): Promise<Insights> {
+    tick();
+    const rand = rng(insightsSeed() * 7 + days);
+    const runs = Math.round(days * (9 + rand() * 5));
+    const failed = Math.round(runs * (0.1 + rand() * 0.06));
+    const median = 88000 + Math.round(rand() * 20000);
+    return {
+      range_days: days,
+      runs,
+      passed: runs - failed,
+      failed,
+      median_ms: median,
+      p90_ms: Math.round(median * 1.72),
+      recovery_ms: 1_950_000 + Math.round(rand() * 900_000),
+      longest_red_ms: 7_600_000 + Math.round(rand() * 3_000_000),
+      calendar: buildCalendar(),
+      stages: mockStages(),
+      flaky: mockFlaky(),
+      trend: mockTrend(days),
+      wait: mockWait(days),
+      skew: mockSkew(),
+      causes: mockCauses(),
+    };
+  },
+  async workerActivity(name: string): Promise<WorkerActivity> {
+    tick();
+    const jobs = jobsOn(name);
+    const calendar = buildWorkerCalendar(name, jobs);
+    // Totals come from the calendar, not from `jobs`: the simulator only holds
+    // a few hours of runs, and reporting "9 jobs, ever" beside a year of green
+    // squares would be the page contradicting itself.
+    const total = calendar.reduce((n, d) => n + d.count, 0);
+    const done = jobs.filter((j) => j.finished_at !== null);
+    const failRate = done.length ? done.filter((j) => j.status === 'failed').length / done.length : 0.08;
+    const durations = done.map((j) => j.finished_at! - j.started_at!).sort((a, b) => a - b);
+    const median = durations.length ? durations[Math.floor(durations.length / 2)] : null;
+    const failed = Math.round(total * failRate);
+    return {
+      name,
+      calendar,
+      total_jobs: total,
+      passed: total - failed,
+      failed,
+      busy_ms: median !== null ? total * median : 0,
+      median_ms: median,
+      recent: jobs.slice(0, 40),
+    };
+  },
   async run(id: number | string): Promise<Run | null> {
     tick();
     const run = state.runs.find((r) => r.id === Number(id));
@@ -716,6 +1125,8 @@ export const mockApi: Api = {
     if (!job) return null;
     return { run: structuredClone(run), job: structuredClone(job), log: logFor(job) };
   },
+  // Kept in step with the live adapter even though no button calls it — see
+  // the note there.
   async trigger() {
     tick();
     const start = Date.now();

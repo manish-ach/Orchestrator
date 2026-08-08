@@ -1,6 +1,9 @@
-// Derived activity data + the two canvas charts still in use.
-// Activity at any instant is derived from job started/finished timestamps,
-// so history is exact and works after a reload — no sampling daemon.
+// Derived activity data, plus the one canvas chart left.
+//
+// Activity at any instant is derived from job started/finished timestamps, so
+// history is exact and survives a reload — there is no sampling daemon to miss
+// anything. `drawStatChart` is the exception: CPU/RAM cannot be derived from
+// timestamps, so those come from heartbeat samples the coordinator stores.
 
 import type { Job, Run, StatSample, Worker } from './types';
 
@@ -77,31 +80,9 @@ export function deviceStats(intervals: BusyInterval[], act: Activity): DeviceSta
   };
 }
 
-/** Fraction of each time bucket the given jobs kept a worker busy. */
-export function utilizationSeries(jobs: Job[], t0: number, t1: number, buckets = 44): number[] {
-  const total = Math.max(t1 - t0, 1000);
-  const step = total / buckets;
-  return Array.from({ length: buckets }, (_, i) => {
-    const bs = t0 + i * step;
-    const be = bs + step;
-    let busy = 0;
-    for (const j of jobs) {
-      if (!j.started_at) continue;
-      const s = Math.max(j.started_at, bs);
-      const e = Math.min(j.finished_at ?? t1, be);
-      if (e > s) busy += e - s;
-    }
-    return busy / step;
-  });
-}
-
 const LIGHT = {
   text: 'oklch(0.47 0.014 110)',
   grid: 'oklch(0.945 0.004 110)',
-  brand: 'oklch(0.52 0.105 112)',
-  brandFill: 'oklch(0.52 0.105 112 / 0.18)',
-  passed: 'oklch(0.55 0.13 145)',
-  failed: 'oklch(0.53 0.19 27)',
 };
 
 function prep(canvas: HTMLCanvasElement) {
@@ -117,66 +98,11 @@ function prep(canvas: HTMLCanvasElement) {
 }
 
 /**
- * Utilization-over-time line chart (CPU-monitor style): values are 0..1 per
- * bucket; y axis 0–100% with gridlines, x axis labelled via opts.
- */
-export function drawUtilChart(
-  canvas: HTMLCanvasElement,
-  values: number[],
-  opts: { totalLabel?: string; midLabel?: string } = {},
-): void {
-  const C = LIGHT;
-  const { ctx, w, h } = prep(canvas);
-  const padL = 36;
-  const padT = 6;
-  const padB = 16;
-  const cw = w - padL - 8;
-  const ch = h - padT - padB;
-  ctx.font = '9.5px ui-monospace, Menlo, Consolas, monospace';
-  ([[1, '100%'], [0.5, '50%'], [0, '0%']] as const).forEach(([f, label]) => {
-    const y = Math.round(padT + (1 - f) * ch) + 0.5;
-    ctx.strokeStyle = C.grid;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(padL, y);
-    ctx.lineTo(w - 8, y);
-    ctx.stroke();
-    ctx.fillStyle = C.text;
-    ctx.fillText(label, 4, y + 3);
-  });
-  const step = cw / Math.max(values.length - 1, 1);
-  ctx.beginPath();
-  values.forEach((v, i) => {
-    const x = padL + i * step;
-    const y = padT + (1 - Math.min(v, 1)) * ch;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.strokeStyle = C.brand;
-  ctx.lineWidth = 1.5;
-  ctx.lineJoin = 'round';
-  ctx.stroke();
-  ctx.lineTo(padL + cw, padT + ch);
-  ctx.lineTo(padL, padT + ch);
-  ctx.closePath();
-  ctx.fillStyle = C.brandFill;
-  ctx.fill();
-  ctx.fillStyle = C.text;
-  ctx.fillText('0s', padL, h - 4);
-  if (opts.totalLabel) {
-    const tw = ctx.measureText(opts.totalLabel).width;
-    ctx.fillText(opts.totalLabel, w - 8 - tw, h - 4);
-  }
-  if (opts.midLabel) {
-    const mw = ctx.measureText(opts.midLabel).width;
-    ctx.fillText(opts.midLabel, padL + cw / 2 - mw / 2, h - 4);
-  }
-}
-
-/**
- * Device-monitor line chart over real heartbeat samples: x is wall time in
- * [t0, t1], y is 0–100%. Gaps longer than a few heartbeats break the line,
- * so an offline stretch reads as missing data rather than a flat line.
+ * One heartbeat metric over time, as a filled line on a 0–100% axis.
+ *
+ * Draws a separate path per contiguous stretch of samples rather than one
+ * continuous line: a worker that went offline for two minutes should leave a
+ * gap, not a straight line implying it was idling through the outage.
  */
 export function drawStatChart(
   canvas: HTMLCanvasElement,
@@ -234,26 +160,4 @@ export function drawStatChart(
     seg.push(s);
   }
   flush();
-}
-
-export interface SparkSlot {
-  count: number;
-  failed: boolean;
-}
-
-/** Mini bar chart: one column per slot, red where the slot saw a failure. */
-export function drawSparkBars(canvas: HTMLCanvasElement, slots: SparkSlot[]): void {
-  const C = LIGHT;
-  const { ctx, w, h } = prep(canvas);
-  const max = Math.max(...slots.map((s) => s.count), 1);
-  const slot = w / Math.max(slots.length, 1);
-  const barW = Math.min(18, Math.max(2, slot - 2.5));
-  slots.forEach((s, i) => {
-    if (!s.count) return;
-    const bh = Math.max(3, (s.count / max) * (h - 3));
-    ctx.fillStyle = s.failed ? C.failed : C.passed;
-    ctx.beginPath();
-    ctx.roundRect(i * slot + (slot - barW) / 2, h - bh, barW, bh, 1.5);
-    ctx.fill();
-  });
 }

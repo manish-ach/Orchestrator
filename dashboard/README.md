@@ -18,15 +18,21 @@ which also makes CORS a non-issue because the UI and the API share an origin.
 
 ## Pages
 
-| Route              | What it shows                                                              |
-| ------------------ | -------------------------------------------------------------------------- |
-| `#/`               | Overview: stat tiles, contribution calendar, worker utilization, updates feed |
-| `#/runs`           | Full run history: status filter chips + search over every run               |
-| `#/repos`          | Repository list with search and latest-run bars                             |
-| `#/repo/<name>`    | One repo: latest-run hero, pipeline switcher, runs, About/Contributors/Languages |
-| `#/run/<id>`       | One run (GitHub Actions-style): summary + DAG canvas, annotations, device monitor (real CPU/RAM), per-job full logs |
-| `#/run/<id>?job=<id>` | Deep link straight into a job's log view                                 |
-| `#/monitor`        | Fleet utilization + per-worker health/timeline cards                        |
+| Route | What it shows |
+| --- | --- |
+| `#/` | Control center: KPI tiles, live pipeline DAG, worker cluster, recent runs, fleet chart |
+| `#/runs` | Run history: status chips, repo/trigger/when facets, search, day grouping |
+| `#/run/<id>` | One run: stage tree + pipeline file, DAG canvas, workers, live streaming logs |
+| `#/run/<id>?job=<id>` | Deep link straight into one job's log |
+| `#/repos` | Registered repositories |
+| `#/repos/<repo>` | That repo's pipelines |
+| `#/repos/<repo>/<pipeline>` | That pipeline's own run history, with duration-vs-median bars |
+| `#/workers` | The fleet as a list — live state per machine |
+| `#/workers/<name>` | One machine: device profile, activity calendar, CPU/RAM, what it runs |
+| `#/insights` | Aggregates: stage cost, flaky jobs, duration trend, queue wait, worker skew, failure causes |
+
+`#/monitor` and `#/repo/<name>` redirect to their replacements, so older links
+still resolve. Anything else renders a styled 404 naming the route that failed.
 
 ## Data modes
 
@@ -74,14 +80,17 @@ the coordinator gets it (Postgres, memory, the Forgejo API) is its business.
 | `POST /api/auth/login`        | `{ "username", "password" }` → `{ "token" }`; the dashboard sends it as `Authorization: Bearer <token>` on every call below (workers/webhooks stay tokenless) |
 | `GET  /api/workers`           | see Worker below                          |
 | `GET  /api/workers/stats`     | rolling CPU/RAM sample history per worker (shape below) |
+| `GET  /api/workers/{name}/activity` | one machine's job history: year calendar, totals, median, busy time, recent jobs |
 | `GET  /api/jobs`              | flat job list across all runs             |
 | `POST /api/pipelines/trigger` | optional `{ "repo": "<name>" }` body — runs that repo's pipeline YAML (parsed by yaml-parser); without it, the local pipeline.yml. Returns `{ "id": <run id> }` |
 | `GET  /api/runs`              | runs with nested jobs (shape below)       |
 | `GET  /api/runs/{id}`         | one run                                   |
 | `GET  /api/jobs/{id}/logs`    | `{ "output": "<full stdout+stderr>" }`    |
+| `GET  /api/jobs/{id}/logs/stream` | server-sent events; each `log` event carries only the bytes written since the last one, and an `end` event closes the stream when the job is terminal |
 | `GET  /api/repos`             | registered Forgejo repos (shape below)    |
 | `POST /api/repos`             | register a repo: `{ "remote": "https://git.example.com/owner/repo" }` |
 | `GET  /api/activity/calendar` | daily run counts for the past year        |
+| `GET  /api/insights?range=<days>` | everything the Insights page shows for one window (1–365, clamped) |
 
 Repos are registered from the dashboard's **+ Add repo** button (or curl).
 The coordinator fetches metadata from the Forgejo instance in the URL
@@ -103,6 +112,8 @@ private repos.
   "repo": "CI-CD-orchestrator",
   "pipeline_file": ".orchestrator/ci.yml",
   "trigger": "webhook",              // "webhook" | "manual" | "schedule"
+  "branch": "main",                  // null for runs created before it was
+                                     // recorded; not backfillable
   "commit": {                        // null for schedule-triggered runs
     "sha": "9c04b17",
     "message": "fix: reaper marks offline after 5s, not 50s",
@@ -129,10 +140,20 @@ private repos.
   "command": "cargo test --lib",
   "status": "failed",
   "worker": "rohan-mac",             // null until claimed
+  "ready_at": 1783240024000,         // when every `needs` passed AND a placement
+                                     // was found — `started_at - ready_at` is the
+                                     // queue wait, and nothing else records it
+  "requeue_count": 0,                // times a worker died mid-job
   "started_at": 1783240026000,       // set on claim
   "finished_at": 1783240049000,      // set on report
   "exit_code": 1,                    // from the executor
-  "output": "running 14 tests\n..."  // full stdout+stderr text
+  "first_error": "error: test failed, to rerun pass `--lib`",
+                                     // one line distilled on report, so list
+                                     // responses can explain a failure
+  "output": null                     // OMITTED on list responses by design — a
+                                     // run list carrying every job's build log
+                                     // is megabytes per poll. Fetch it from
+                                     // /api/jobs/{id}/logs when you need it.
 }
 ```
 
@@ -144,7 +165,10 @@ the device monitor graphs real numbers instead of inferring them.
 **3. Workers** (`last_heartbeat`/`registered_at` are ms epoch; state lives
 in Redis and `status` is computed from heartbeat age; `tags` are the
 capability labels from `--tags`/`WORKER_TAGS`; `stats` is the latest
-machine sample from the heartbeat, `null` until one arrives):
+machine sample from the heartbeat, `null` until one arrives; `device` is
+sampled **once at registration** — none of it changes while the agent lives,
+so re-sending it on every heartbeat would be pure noise, and it is `null` for
+agents too old to send one):
 
 ```jsonc
 // GET /api/workers → Worker[]
@@ -152,7 +176,31 @@ machine sample from the heartbeat, `null` until one arrives):
   "last_heartbeat": 1783240050000, "registered_at": 1783150000000,
   "tags": ["heavy"], "job_id": 7,
   "stats": { "cpu_pct": 57.2, "mem_pct": 58.1,
-             "mem_used_mb": 9420, "mem_total_mb": 16384 } }
+             "mem_used_mb": 9420, "mem_total_mb": 16384 },
+  "device": {
+    "os": "Debian GNU/Linux 12 (bookworm)",  // null where the OS cannot say
+    "os_id": "debian",                       // the key the UI picks a logo by
+    "kernel": "6.1.0-28-arm64", "host": "nxtcloud-m", "arch": "aarch64",
+    "cpu": "Ampere Altra", "cpu_cores": 4, "cpu_physical": 4, "cpu_mhz": 3000,
+    "mem_total_mb": 8192,
+    "disk_total_gb": 160, "disk_free_gb": 96,  // the filesystem the workspace
+                                               // is on, NOT every mounted disk
+    "shell": "/bin/bash", "agent": "0.1.0", "executor": "local" } }
+```
+
+**3c. One machine's history.** Keyed by worker **name**, not id: a box that
+lost its id file and re-registered is still the same machine to whoever is
+reading the page. Answers for a name with no jobs rather than 404ing.
+
+```jsonc
+// GET /api/workers/{name}/activity → WorkerActivity
+{ "name": "rechek",
+  "calendar": [{ "date": "2026-08-07", "count": 4 }, ...],  // 365 days, oldest first
+  "total_jobs": 427, "passed": 401, "failed": 26,
+  "busy_ms": 18400000, "median_ms": 43000,   // median null until one job finishes
+  "recent": [{ "job_id": 7, "run_id": 3, "repo": "…", "pipeline": "…",
+               "stage": "test", "name": "unit-tests", "status": "passed",
+               "started_at": 1783240026000, "finished_at": 1783240049000 }, ...] }
 ```
 
 **3b. Worker stats history.** Each heartbeat (every 2s) appends a sample;
@@ -163,6 +211,21 @@ screen's device monitor draws these directly:
 // GET /api/workers/stats → WorkerStatsSeries[]
 { "id": "6f9c…", "name": "rechek", "status": "online",
   "samples": [{ "t": 1783240050000, "cpu": 57.2, "mem": 58.1 }, ...] }
+```
+
+**3d. Pipeline definitions.** Each `PipelineRef` now carries the *declared*
+shape, planned through the real yaml-parser when the coordinator discovers the
+repo. That is what lets a pipeline show its stages before it has ever run —
+and what lets a file that does not validate say so instead of rendering half a
+graph.
+
+```jsonc
+{ "name": "orchestrator-nightly", "file": ".orchestrator/nightly.yml",
+  "stages": ["e2e", "report"],
+  "jobs": [{ "name": "chaos-kill-worker", "stage": "e2e",
+             "needs": ["spawn-cluster"], "tags": ["heavy"] }],
+  "parse_error": null,          // the reason, when the file does not plan
+  "schedule": "0 2 * * *" }     // top-level `schedule:` in the file, verbatim
 ```
 
 **4. Repos.** The coordinator proxies Forgejo: repo info from
@@ -187,6 +250,47 @@ pipelines by probing for `pipeline.yml` / `.orchestrator/ci.yml`:
 
 Missing fields degrade gracefully ("not configured" / "unknown" / "no data").
 
+**4b. Insights.** One window's aggregates, in one response. The coordinator
+fetches a single job×run join for the window and derives everything from it in
+memory (`src/insights.rs`), which is why every number here is unit-tested
+without a database. Fields that cannot be computed are `null`, never `0`.
+
+```jsonc
+// GET /api/insights?range=30 → Insights
+{ "range_days": 30, "runs": 412, "passed": 358, "failed": 54,
+  "median_ms": 48000, "p90_ms": 98000,
+  "recovery_ms": 2040000,      // median red → next green, per pipeline
+  "longest_red_ms": 7800000,   // a pipeline still red counts up to now
+  "calendar": [ /* CalendarDay[], a full year regardless of range */ ],
+  "stages": [{ "stage": "test", "jobs": 3, "median_ms": 64000,
+               "p90_ms": 98000, "runs": 190 }],   // stage WALL time, not the
+                                                  // sum of parallel jobs
+  "flaky": [{ "name": "migrate-db", "repo": "student-service",
+              "flips": 4,            // commits where it both passed and failed
+              "recent": "ppfpfppp" }],
+  "trend": [{ "date": "2026-08-07", "runs": 14, "p50_ms": 46000, "p90_ms": 91000 }],
+  "wait":  [{ "date": "2026-08-07", "wait_ms": 240000, "exec_ms": 1800000 }],
+  "skew":  { "job": "unit-tests",    // null when no job ran on 2+ machines
+             "workers": [{ "worker": "beefy-1", "runs": 41,
+                           "median_ms": 42000, "pass_pct": 98 }] },
+  "causes": [{ "cause": "database not seeded", "job": "migrate-db",
+               "exit_code": 1, "count": 21 }] }
+```
+
+**4c. Webhook delivery.** Every repo carries the last time its webhook actually
+reached the coordinator. Recorded for accepted *and* rejected deliveries, since
+a rejection still proves the hook is wired up, and which kind it was is the
+whole diagnostic. Stored in its own table rather than on the repo blob, which
+the 2-minute Forgejo refresh overwrites wholesale.
+
+```jsonc
+"webhook": { "last_at": 1783240050000, "event": "push",
+             "status": "accepted",     // or "rejected"
+             "detail": null }          // why, when rejected
+// absent entirely when no push has ever arrived — which is the case the
+// dashboard flags, since "quiet" and "misconfigured" otherwise look identical
+```
+
 **5. Daily activity** for the contribution calendar:
 
 ```jsonc
@@ -206,16 +310,30 @@ worker registry + ready-job queue in **Redis** (both from the repo's
 `docker-compose.yml` — `docker compose up -d`). The dashboard never sees
 any of that; it only speaks the HTTP contract above.
 
-### Polling, not push
+### Polling for state, streaming for logs
 
-Every page polls every 3 seconds (paused while the tab is hidden). No
-WebSocket/SSE is required; if the coordinator later adds SSE, only
-`src/lib/poll.ts` needs to change.
+Every page polls every 3 seconds for run/worker state, paused while the tab is
+hidden (`src/lib/poll.ts`). That cadence is right for a status rail and wrong
+for a build log — a stage that takes 30 seconds would show its output only
+after it finished. So job logs go over **server-sent events** instead
+(`src/lib/logstream.ts`), each event carrying only the bytes written since the
+last one.
+
+`EventSource` cannot send an `Authorization` header, so on a coordinator with
+dashboard auth enabled the stream is refused; the client falls back to polling
+the log endpoint and emitting the same deltas. A slower log, never no log. Mock
+mode takes the same fallback path, since there is no server to stream from.
+
+The coordinator's end (`job_log_stream` in `src/api.rs`) polls the row rather
+than subscribing to a channel, deliberately: a job's log has two possible
+writers — the worker forwarding its executor's tail, or the executor posting
+straight to the coordinator — and a broadcast channel would only ever see one
+of them.
 
 ## Source layout
 
     src/
-      app.css               the whole design system (documented in /DESIGN.md)
+      shell.css             the whole design system (documented in /DESIGN.md)
       main.ts               entry
       App.svelte            hash router outlet
       lib/
@@ -224,10 +342,22 @@ WebSocket/SSE is required; if the coordinator later adds SSE, only
         types.ts            typed contract (mirror of this README)
         charts.ts           activity derivation + canvas charts
         format.ts           fmtDur / ago / status glyphs
+        logsteps.ts         splits a log into `sh -x` steps + line classification
+        logstream.ts        SSE job-log stream, with a polling fallback
         poll.ts             3s polling + 1s wall-clock store
         router.ts           tiny hash router
-        components/         Topbar, Snackbar, StatusPill, Strip, Avatar, ...
+        yamlhl.ts           hand-rolled YAML highlighter for the pipeline view
+        components/
+          AppShell  Palette  FlowCanvas  FleetChart  Calendar
+          OsLogo  FacetDropdown  Sparkline  Strip
       pages/
-        Overview.svelte  Repos.svelte  RepoDetail.svelte  RunDetail.svelte  Monitor.svelte
+        Overview.svelte   Control center
+        History.svelte    Runs
+        RunDetail.svelte  one run
+        Repos.svelte      repositories → pipelines → that pipeline's runs
+        Workers.svelte    the fleet, and one device
+        Insights.svelte   aggregates
+        NotBuilt.svelte   404
+        Login.svelte      shown only when the coordinator requires auth
 
     legacy/                 the original pre-redesign HTML shell (reference only)

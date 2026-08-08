@@ -25,7 +25,7 @@
 
 <div class="login-screen">
   <div class="login-band">
-    <span class="wordmark">orchestrator</span>
+    <span class="login-mark">Orchestrator<small>CI · CD</small></span>
   </div>
   <form class="card login-card" onsubmit={submit}>
     <h1>Sign in</h1>
@@ -40,7 +40,7 @@
       <span>password</span>
       <input type="password" bind:value={password} autocomplete="current-password" required />
     </label>
-    <button class="btn btn-lime login-btn" type="submit" disabled={busy || !username || !password}>
+    <button class="btn primary login-btn" type="submit" disabled={busy || !username || !password}>
       {busy ? 'Signing in…' : 'Sign in'}
     </button>
     <p class="login-hint">Credentials come from <code>DASHBOARD_USERNAME</code> / <code>DASHBOARD_PASSWORD</code> in the coordinator's environment.</p>

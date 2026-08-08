@@ -4,11 +4,12 @@
   import { route } from './lib/router';
   import History from './pages/History.svelte';
   import Login from './pages/Login.svelte';
-  import Monitor from './pages/Monitor.svelte';
   import Overview from './pages/Overview.svelte';
-  import RepoDetail from './pages/RepoDetail.svelte';
   import RunDetail from './pages/RunDetail.svelte';
+  import NotBuilt from './pages/NotBuilt.svelte';
   import Repos from './pages/Repos.svelte';
+  import Workers from './pages/Workers.svelte';
+  import Insights from './pages/Insights.svelte';
 
   const page = $derived($route.path[0] ?? '');
 
@@ -34,16 +35,24 @@
   {:else if page === 'repos'}
     <Repos />
   {:else if page === 'repo'}
-    {#key $route.path[1]}
-      <RepoDetail name={decodeURIComponent($route.path[1] ?? '')} />
-    {/key}
+    <!-- repo detail moved under Repositories; keep old links working -->
+    {@const _ = (location.hash = `/repos/${$route.path[1] ?? ''}`)}
+    <Repos />
   {:else if page === 'run'}
     {#key $route.path[1]}
       <RunDetail id={$route.path[1] ?? ''} initialJob={$route.query.get('job')} />
     {/key}
+  {:else if page === 'workers'}
+    <Workers />
   {:else if page === 'monitor'}
-    <Monitor />
-  {:else}
+    <!-- the fleet view moved to Workers; keep old links and bookmarks working -->
+    {@const _ = (location.hash = '/workers')}
+    <Workers />
+  {:else if page === 'insights'}
+    <Insights />
+  {:else if page === '' || page === 'overview'}
     <Overview />
+  {:else}
+    <NotBuilt path={$route.path.join('/')} />
   {/if}
 {/if}
