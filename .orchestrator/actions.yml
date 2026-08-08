@@ -34,37 +34,24 @@ jobs:
     artifacts: [release.tar.gz]
     script: tar czf release.tar.gz build-info.txt .orchestrator && ls -lh release.tar.gz
 
-  # Offloaded compilation: the server is too weak to compile Rust, so a
-  # `heavy`-tagged worker (with docker) builds the release binary and the
-  # dashboard for the server's platform and ships them as one artifact.
-  # self-deploy then bakes a runtime-only image from them in seconds.
-  compile-release:
-    stage: package
-    image: docker:28-cli
-    tags: [heavy, docker]
-    artifacts: [prebuilt.tar.gz]
-    env:
-      JOB_TIMEOUT: "3600"
-      # the platform the SERVER runs on (`uname -m` there) — nxtcloud-m
-      # is aarch64
-      TARGET_PLATFORM: linux/arm64
-    script: |
-      # non-main pushes don't deploy, so don't burn 10 minutes compiling;
-      # ship an empty bundle to keep the declared artifact satisfied
-      [ "$REPO_BRANCH" = "main" ] || { echo "push was to '$REPO_BRANCH' — skipping release build"; mkdir -p prebuilt && tar czf prebuilt.tar.gz prebuilt; exit 0; }
-      docker build --platform "$TARGET_PLATFORM" --target rust -t orchestrator-xbuild .
-      mkdir -p prebuilt
-      id=$(docker create --platform "$TARGET_PLATFORM" orchestrator-xbuild)
-      docker cp "$id":/build/target/release/orchestrator prebuilt/orchestrator
-      docker rm "$id"
-      docker build --target dashboard -t orchestrator-dashbuild .
-      id=$(docker create orchestrator-dashbuild)
-      docker cp "$id":/build/dist prebuilt/dist
-      docker rm "$id"
-      tar czf prebuilt.tar.gz prebuilt
-      ls -lh prebuilt.tar.gz
+  # NOTE ON WHERE THE BUILD RUNS
+  # There used to be a `compile-release` job here, tagged [heavy, docker], that
+  # cross-compiled on a beefier machine and shipped the binary + dashboard as an
+  # artifact so self-deploy could bake a runtime-only image in seconds.
+  #
+  # It was removed because a tagged job WAITS FOREVER when no worker carries its
+  # tags — so if the laptop was not running, the whole pipeline parked at this
+  # stage and self-deploy (which needed it) never ran. A deploy that silently
+  # never happens is worse than a slow one.
+  #
+  # self-deploy now always takes its own slow path: `docker compose build` with
+  # the full Dockerfile, compiling Rust and the dashboard on the server itself.
+  # To restore the offload later: re-add the job, put `compile-release` back in
+  # self-deploy's `needs`, and give the building machine a worker started with
+  # `--tags heavy,docker`. Do NOT re-add it without a worker that carries them.
 
-  # Self-deploy: rebuild the running stack from the pushed commit. Needs the
+  # Self-deploy: rebuild the running stack from the pushed commit, compiling
+  # Rust and the dashboard here (see the note above on where builds run). Needs the
   # server-side override that mounts the docker socket + the stack checkout
   # into the executor (README: "Self-deploy") — fails with a hint otherwise.
   # Images build inside this job (logs land in the dashboard); the final
@@ -73,7 +60,7 @@ jobs:
   self-deploy:
     stage: deploy
     image: docker:28-cli
-    needs: [package, compile-release]
+    needs: [package]
     env:
       JOB_TIMEOUT: "3600"
       # must run on the server's own worker — other machines have no
@@ -87,8 +74,10 @@ jobs:
       git -C /host/stack fetch origin "$REPO_BRANCH"
       git -C /host/stack reset --hard "${COMMIT_SHA:-origin/$REPO_BRANCH}"
       chown -R "$(stat -c %u /host/stack/.git):$(stat -c %g /host/stack/.git)" /host/stack
-      # prefer the binary/dashboard compiled by compile-release: bake the
-      # runtime-only image (seconds) instead of compiling Rust here (minutes)
+      # Kept live so restoring the offload (see the note above) needs no change
+      # here: if a job ever ships a prebuilt.tar.gz again, bake the runtime-only
+      # image from it in seconds. With no such job, this falls through to
+      # compiling on this machine, which is the current intended path.
       tar xzf prebuilt.tar.gz 2>/dev/null || true
       if [ -x prebuilt/orchestrator ] && [ -d prebuilt/dist ]; then
         echo "using prebuilt artifacts — building runtime-only image"
@@ -99,9 +88,11 @@ jobs:
         echo "no usable prebuilt artifacts — compiling on this machine (slow path)"
       fi
       docker compose --project-directory /host/stack build
-      # never swap to an image that can't even exec on this machine — a
-      # prebuilt binary for the wrong TARGET_PLATFORM dies with exit 255
-      # and would take the whole stack down
+      # Never swap to an image that cannot exec here. This mattered most for
+      # prebuilt binaries built for the wrong platform (exit 255), and is cheap
+      # insurance either way — a stack that cannot start is worse than a red run.
+      # NOTE: `--help` proves the binary runs, NOT that the coordinator starts;
+      # it does not touch Postgres, so a failed migration still gets through.
       if ! docker run --rm orchestrator-coordinator orchestrator --help > /dev/null 2>&1; then
         if [ -n "$ORCHESTRATOR_DOCKERFILE" ]; then
           echo "prebuilt image failed its smoke test (TARGET_PLATFORM vs 'uname -m' mismatch?) — rebuilding from source"
