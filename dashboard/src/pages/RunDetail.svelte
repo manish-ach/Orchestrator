@@ -388,8 +388,14 @@
               {:else if !yaml}
                 <p class="none">Reading {run.pipeline_file}…</p>
               {:else}
-                <pre class="yaml">{#each yamlLines as l, i (i)}<span class="yl"
-                      ><i class="ln">{i + 1}</i>{@html l}</span
+<!-- One span per token, not {@html}: highlightYaml returns token objects,
+                   and interpolating the array stringified it to "[object Object]".
+                   Rendering them as elements also means file contents are never
+                   treated as markup. -->
+                <pre class="yaml">{#each yamlLines as toks, i (i)}<span class="yl"
+                      ><i class="ln">{i + 1}</i><span class="yc"
+                        >{#each toks as t, k (k)}<span class={t.cls}>{t.text}</span>{/each}</span
+                      ></span
                     >{/each}</pre>
               {/if}
             </div>
