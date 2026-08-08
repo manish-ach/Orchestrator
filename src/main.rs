@@ -7,6 +7,10 @@ mod api;
 mod store;
 mod pipeline;
 mod forgejo;
+mod insights;
+mod schedule;
+mod tui;
+mod ui;
 
 #[derive(Subcommand)]
 enum Module {
@@ -28,6 +32,14 @@ enum Module {
         ///Comma-separated capability tags, e.g. heavy,docker [env: WORKER_TAGS]
         #[arg(long)]
         tags: Option<String>,
+        ///Force the full-screen dashboard even when stdout is not a terminal
+        #[arg(long, conflicts_with = "no_tui")]
+        tui: bool,
+        ///Plain timestamped log lines instead of the dashboard. Servers and
+        ///systemd units want this; it is also the automatic choice when stdout
+        ///is not a terminal, so you rarely need to pass it.
+        #[arg(long)]
+        no_tui: bool,
     },
 }
 
@@ -46,6 +58,9 @@ async fn main() {
 
     match args.module {
         Module::Coordinator { port } => coordinator::execute(port).await,
-        Module::Worker { name, coordinator, executor, tags } => worker::run(name, coordinator, executor, tags).await,
+        Module::Worker { name, coordinator, executor, tags, tui, no_tui } => {
+            let mode = ui::Mode::resolve(tui, no_tui);
+            worker::run(name, coordinator, executor, tags, mode).await
+        }
     }
 }

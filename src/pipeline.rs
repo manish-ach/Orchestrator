@@ -82,8 +82,54 @@ pub async fn plan_from_yaml(content: &str) -> Result<Plan, String> {
 /// Extract the pipeline `name:` from raw YAML without invoking the parser —
 /// used to label PipelineRefs so the dashboard can match runs to pipelines.
 pub fn yaml_pipeline_name(yaml: &str) -> Option<String> {
+    top_level(yaml, "name")
+}
+
+/// Extract a top-level `schedule:` cron expression, if the file declares one:
+///
+///     name: nightly
+///     schedule: "0 2 * * *"
+///
+/// Read here rather than through the Python parser so a schedule is visible on
+/// a pipeline that has never run — and so adding it needed no change to the
+/// parser's contract.
+pub fn yaml_schedule(yaml: &str) -> Option<String> {
+    top_level(yaml, "schedule")
+}
+
+/// First top-level `key:` value in the document. Only column-zero lines count,
+/// so a `schedule:` nested under a job is not mistaken for the pipeline's own.
+fn top_level(yaml: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
     yaml.lines()
-        .find(|l| l.starts_with("name:"))
-        .map(|l| l.trim_start_matches("name:").trim().trim_matches(['"', '\'']).to_string())
+        .find(|l| l.starts_with(&prefix))
+        .map(|l| l[prefix.len()..].trim().trim_matches(['"', '\'']).to_string())
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod yaml_tests {
+    use super::*;
+
+    #[test]
+    fn reads_top_level_keys_only() {
+        let yaml = "name: nightly
+schedule: \"0 2 * * *\"
+jobs:
+  build:
+    schedule: ignored
+";
+        assert_eq!(yaml_pipeline_name(yaml).as_deref(), Some("nightly"));
+        assert_eq!(yaml_schedule(yaml).as_deref(), Some("0 2 * * *"));
+    }
+
+    #[test]
+    fn a_file_without_a_schedule_has_none() {
+        assert_eq!(yaml_schedule("name: ci
+jobs: {}
+"), None);
+        // an empty value is absent, not a schedule that matches everything
+        assert_eq!(yaml_schedule("schedule:
+"), None);
+    }
 }

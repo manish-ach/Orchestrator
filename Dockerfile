@@ -15,7 +15,7 @@ FROM rust:1-bookworm AS rust
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 # compile dependencies against a dummy main in their own layer, so a source
-# change only rebuilds this crate — not axum/sqlx/tokio all over again
+# change only rebuilds this crate - not axum/sqlx/tokio all over again
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
     && rm -rf src
@@ -31,14 +31,17 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
-# yaml-parser runs via its own uv-managed venv (uv fetches python itself)
+# yaml-parser runs via its own uv-managed venv (uv fetches python itself).
+# Not optional: besides planning triggered runs, the coordinator now parses
+# every registered repo's pipeline file on its 2-minute refresh, so the
+# dashboard knows a pipeline's shape before it has ever run.
 COPY yaml-parser/pyproject.toml yaml-parser/uv.lock yaml-parser/
 COPY yaml-parser/*.py yaml-parser/
 RUN cd yaml-parser && uv sync --no-dev
 
 COPY --from=rust /build/target/release/orchestrator /usr/local/bin/orchestrator
 COPY --from=dashboard /build/dist /app/dashboard/dist
-# this repo's own pipeline — the trigger fallback until it's pushed to Forgejo
+# this repo's own pipeline. the trigger fallback until it's pushed to Forgejo
 COPY .orchestrator .orchestrator
 
 ENV YAML_PARSER_DIR=/app/yaml-parser \

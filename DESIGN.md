@@ -1,60 +1,187 @@
 # Design
 
-Implementation: **Svelte 5 + TypeScript + Vite** (`dashboard/src/`), hash-routed static bundle; all HTTP goes through `src/lib/api.ts`; the visual system below lives in `src/app.css`.
+Implementation: **Svelte 5 + TypeScript + Vite** (`dashboard/src/`), hash-routed
+static bundle. All HTTP goes through `src/lib/api.ts`; the whole visual system
+lives in `src/shell.css`. There is no second stylesheet — the old `app.css` was
+retired once the last page moved over, so a class defined in `shell.css` is the
+only definition of it, and a collision is a bug rather than a cascade to reason
+about.
 
-Split-tone console. Every page opens with a dark olive-ink **command band** (top bar + page title + headline stats/summary, bright values on dark) and continues into a **light workbench** — elevated white cards with soft shadows on a faint gray-tinted ground. Task-manager-inspired activity graphs; monospace readouts; committed color. Rich but calibrated: every tile earns its place with derived data.
+The shape is a **persistent shell**: a dark sidebar on the left, a status rail
+across the top, and a light workbench underneath. The shell never reloads; only
+the page body changes. `100vh`, `overflow: hidden` — the app owns the viewport,
+and each pane scrolls itself. Two pages opt out with `.page-body.scrolly` (the
+device page and Insights) because they are genuinely taller than a screen.
 
-## Theme
+## What each page is for
 
-Split-tone (user decision, 2026-07-05, third iteration: "add the oomph factor"). Dark band on top of every page, light content area below, dark terminal island for logs.
+The site has one rule, and every page boundary follows from it:
+
+> **If a card's primary key is a run id, it belongs on Control center or Runs.
+> If its primary key is a job name, stage, worker or time bucket, it belongs on
+> Insights.**
+
+With the corollary: **Runs is about executions; Repositories is about
+definitions.** Two pages may show the same underlying rows, but never answer the
+same question with them.
+
+| Route | The question it answers |
+| --- | --- |
+| `#/` | Is the system healthy *right now*? A glimpse only — no "view all" links, no history. |
+| `#/runs` | What has executed, newest first? Filterable by status, repo, branch, trigger and window; searchable; keyboard-navigable. |
+| `#/run/<id>` | What happened in this one run, and what is happening in it now? |
+| `#/repos` | What is registered here? |
+| `#/repos/<repo>` | What pipelines does this repo define? |
+| `#/repos/<repo>/<pipeline>` | How does *this pipeline* behave over its own history? |
+| `#/workers` | Is the fleet healthy right now? Every column is live state. |
+| `#/workers/<name>` | What machine is this, and what has it done? |
+| `#/insights` | Where is time going, what is flaky, and what should we fix? |
+
+Pipelines have no nav item: a pipeline only exists inside a repository, so it is
+reached by drilling down rather than by a fourth top-level list. Nav collapse
+persists in `localStorage` (`orch.sidebar`).
+
+The dashboard is strictly **read-only**. No trigger, retry or cancel buttons
+anywhere — runs come from webhooks or `curl`, and the empty states teach the
+`curl`. A button that lies about what it can do is worse than no button.
+
+## Honesty rules
+
+These are design constraints, not style preferences, and they are the reason
+several obvious-looking widgets are missing:
+
+- **Never invent a field.** No package counts or GPU rows in the device
+  profile, because `sysinfo` cannot answer them portably. Where a field was
+  missing only because the coordinator was discarding it, the fix was to record
+  it rather than to fake it: branch, webhook delivery status and the pipeline
+  definition index all became real for that reason. A pipeline with no indexed
+  definition and no runs still says *"Shape appears after its first run"*.
+- **Distinguish absent from broken.** A repo nobody has pushed to and one whose
+  webhook URL is wrong are the same picture without a delivery record; a
+  never-run pipeline and one whose YAML does not parse are the same empty card
+  without a parse error. Both now say which they are.
+- **A missing value says which kind of missing it is.** `none detected` and
+  `unavailable · heartbeat stale` are different statements; so are `never went
+  red` and `none`.
+- **"Healthy" has to be earned.** The status rail reads *Degraded* whenever a
+  worker is offline or the last poll failed. Reassurance during an outage is a
+  bug.
+- **Aggregates return `None`, not `0`, on no data.** An empty window reports
+  nothing rather than a median of zero.
+- **Every analytical panel ends in one sentence the numbers support.** A panel
+  that cannot produce one is decoration and should be cut.
+- **Say what was dropped.** Lists footer with "showing X of Y matching · Z
+  total" rather than silently truncating.
 
 ## Color
 
-OKLCH throughout. Strategy: committed — the dark olive band carries ~25% of each page; lime accent for the primary action; semantic status colors carry the data.
+OKLCH throughout. Restrained rather than committed: the dark band is now the
+sidebar only, so colour in the content area is almost entirely semantic.
 
-- Band: `--band-bg` oklch(0.215 0.022 118), cards oklch(0.265), wells oklch(0.33), lines oklch(0.34); text `--band-ink` oklch(0.95), `--band-muted` oklch(0.7 0.02 115)
-- Bright status (on band): ok oklch(0.76 0.16 145) · fail oklch(0.7 0.19 25) · run oklch(0.79 0.145 82)
-- `--lime`: oklch(0.8 0.15 118) — primary CTA (dark text), wordmark glyph, nav underline, band graph line
-- Light area: `--bg` oklch(0.975 0.003 110) tinted ground; `--card` white + `--shadow-card`; `--ink` oklch(0.235 0.012 110); `--muted` oklch(0.47); lines 0.895/0.78
-- `--brand`: oklch(0.52 0.105 112) olive — links, light-area buttons (white text), utilization bars, light graph line
-- Status vocabulary (glyph + word + color, never color alone); filled pills (`.st-pill`) for page-level status, tinted bg + status text, band variants darker:
-  - passed `✓` oklch(0.55 0.13 145) · failed `✕` oklch(0.53 0.19 27) (graphs also diagonal-hatched) · running `●` pulsing oklch(0.66 0.13 80) · pending `○` oklch(0.58 0.012 110)
-- Terminal island: bg oklch(0.185 0.008 110), ink oklch(0.88 0.01 110)
-
-## Typography (deltas)
-
-Tile values 32px mono 650; page titles 22px/650, -0.01em. Small-caps labels (11px/600, +0.05em uppercase) are reserved for data-tile labels, panel labels, table headers and stage names — never as section kickers over prose.
+- Sidebar / dark surfaces: `--band` oklch(0.205 0.02 118), lines `--band-line`
+  oklch(0.31), text `--band-ink` oklch(0.96), muted oklch(0.7 0.018 115)
+- Ground `--bg` oklch(0.976 0.003 110); `--card` white; `--surface`
+  oklch(0.962) for wells and hover; lines 0.912 / 0.855
+- Ink: `--ink` oklch(0.225 0.012 110), `--ink-2` 0.38, `--muted` 0.53,
+  `--faint` 0.66
+- `--brand` oklch(0.5 0.105 112) olive — links, primary button, chart lines,
+  active nav. `--lime` oklch(0.8 0.15 118) is the active-nav marker only.
+- Status vocabulary — **glyph + word + colour, never colour alone**:
+  passed `✓` `--ok` oklch(0.53 0.13 145) · failed `✕` `--fail` oklch(0.53 0.19 27)
+  · running `●` `--run` oklch(0.63 0.13 78), pulsing · pending `○` line grey
+- Dark islands (log terminal, device spec block): bg oklch(0.185–0.235 0.012 110),
+  ink oklch(0.85–0.92), keys oklch(0.78 0.075 112)
 
 ## Typography
 
-System stacks only, no webfonts (works offline, loads instantly):
+**IBM Plex Sans** and **IBM Plex Mono**, self-hosted via `@fontsource` — the
+dashboard has to render on a LAN with no route to the internet, and a webfont
+that never arrives is a page of fallbacks. Plex has engineering character and
+holds its shape at 13px, which is the size most of this UI actually runs at.
 
-- UI: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`
-- Data/readouts/logs: `ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace`
+- UI: `var(--ui)` — Plex Sans, 12.5–13.5px body, 19px page titles at -0.015em
+- Data, readouts, logs, identifiers: `var(--mono)` — Plex Mono, 11–12.5px
+- `font-variant-numeric: tabular-nums` on every number that updates in place
+- Small-caps labels (10.5px/600, +0.07em uppercase) are for stat-well labels and
+  section kickers only — never over prose
 
-Fixed rem scale, ratio ~1.2: page title 18px/600, section heading 14px/600, body & tables 13.5px, meta/readouts 12px mono, logs 12.5px mono. `font-variant-numeric: tabular-nums` on all numbers. Sentence case everywhere.
-
-## Layout
-
-Max width 1080px, centered, 24px gutters. Every page: slim top bar (wordmark · breadcrumb · live readout + data-mode chip), then full-width content separated by hairline rules — no card grids, no sidebars. Density is a feature: tables at 13.5px with 10px vertical padding.
+Sentence case everywhere. Em dashes are used sparingly and deliberately; when a
+sentence needs three of them, it needs rewriting instead.
 
 ## Components
 
-- **Command band** (top-level pages): top bar row (`orchestrator` wordmark with lime glyph, breadcrumb, mono readout + MOCK/LIVE chip) with the **nav on its own second row** — overview · runs · repos · monitor at 14.5px/550, 2.5px lime underline on the active page, deliberately prominent rather than tucked beside the logo — plus the page's headline content — Overview: 4 stat tiles; Runs: title + pass/fail meta; Monitor: the dark cluster graph. The dashboard is strictly read-only: no trigger/retry buttons anywhere (runs come from webhooks or curl; the empty states teach the curl).
-- **Overview**: band stat tiles (success rate, active now, avg run duration, queue), each with small-caps label, 32px mono value, sub-line, and a mini visualization (outcome squares, pulsing running squares, duration sparkbars); light area has a **contribution calendar** card (span 8, GitHub-style: one 9px square per day over the past year, 5-step green ramp by run count with grey for quiet days, month + mon/wed/fri labels, less→more legend, total-runs readout; the 15-minute cluster graph lives only on the monitor page now) beside the workers card (span 4) with olive utilization bars; then a GitHub-style **updates feed** of the latest runs (pipeline-file pushes get a yml file chip; "all runs →" links to the Runs page): separate cards, each with an actor header (colored initial avatar + sentence and age) above a nested run box (status glyph, `pipeline #id` + outcome verb, commit message, right rail with the touched yml file chip, repo tag, stage strip). Failures name the failing job in red.
-- **Runs** (`#/runs`, added 2026-07-14): the full history. Band holds title + "every pipeline run, newest first · N passed · M failed". Light area: a control row — status filter chips (`all/passed/failed/running`, each with a mono count, active chip inverts to ink) and a right-aligned 340px search input (matches commit message/sha/author, repo, pipeline, `#id`, trigger, status; input lives outside the polled region) — above one divided list card: rows are status glyph, bold commit-message title (falls back to `Run #id`) over a muted `pipeline #id · sha by author · via trigger` sub-line, right rail with repo tag + stage strip stacked beside mono duration/age. Caps at 50 rows with an honest "showing X of Y matching" footer.
-- **Repos** (repos.html): GitHub-style divided list inside one card, on the roomy `.wide-wrap` container (26px row padding, 18px names, 210×44 sparklines). Band holds only the top bar + nav; the **"Repositories" heading, count, and a light search input (300px)** live in the content area above the list card (search filters by name/description/language/owner/pipeline names; count reads "1 of 3 repos" while filtering, with a no-match empty state; input outside the polled region). The list uses the standard `.wrap` width (not the roomy container), rendered as **one separate card per repo** (16px gaps, hairline border + soft shadow, hover raises the shadow and strengthens the border — no divided mega-card). Each card keeps a clean 4-line left stack: **sans bold INK repo name** (olive on hover) + pipeline-count chip; description; a meta line with `·` separators (language dot, owner, **pass rate in bold green** — amber under 80%; no "updated" item — the age lives on the next line); a one-line **latest-run readout** (status glyph + bold `pipeline #id` + truncated commit message + age). Right rail: latest-run status pill on top, and a compact bar chart of the **last ≤6 runs** (one bar per run, height = duration, failures red, bar width capped at 18px) captioned "last N runs · duration". Row links to repo detail.
-- **Repo detail** (repo.html): treated as an interior page — NO band, NO top nav. A **snackbar** (same component as run detail) carries only ← back, the home mark, the repo name and the latest-run status pill (mode chip at right) — language/branch/owner live in the About card, not the bar. Content sits in a **`.wide-wrap` roomy container** (max 1560px, 40px gutters) that scales everything up: hero 26/32px padding with a 22px title and 46px insight bars, sidebar column 350px, run rows at 15.5px titles with 16px padding; sidebar stacks below 1100px. Below it, a **"Latest run" dark hero card** (`1fr / 300px`, band tokens on a rounded card so it reads nothing like the white list under it): small-caps "Latest run · Nm ago" label, commit message as an 19px title, meta line (author avatar + name, sha chip, `pipeline #id`, trigger, status pill), a large job-outcome strip with "6/6 jobs passed · 1m 41s", and a lime "view run →" button; the right column (band-hairline divider) holds RUNS / SUCCESS / AVG stat blocks over a duration bar chart of the last ≤10 runs (failures red) with a small-caps caption. Repo description now lives at the top of the About sidebar card. The rest: light area is a `1fr / 300px` split with both columns' tops flush — left, ONE pipeline at a time behind a **branch-switcher-style dropdown** in the card header (`⎇ orchestrator-ci ▾` summary chip; the `<details>` menu lists every pipeline with a ✓ on the selected one, latest-status glyph, yml file and run count, sized to content; closes on selection or outside click, open state survives polls; per-pipeline file + run count live in the menu items). Beside the switcher: just a "N pipelines" count, and right-aligned a **run search input** (matches commit message/sha/author, #id, trigger, and status words like "failed"; scoped to the selected pipeline; no query shows the latest 8 runs, a query searches the full history up to 30 matches, with a "No runs match" empty state; the input sits outside the poll-rerendered region so typing survives refreshes). Below, the **big GitHub-workflow-runs-style rows** (bold commit-message title, "pipeline #id: commit sha by author · via trigger" sub-line, branch chip, stacked age + duration rail); right, a **GitHub-style sidebar** sourced from the git remote (Forgejo): **About** (hosted-at link ↗, default branch, owner), **Contributors** (count chip + letter avatars, login + full name), **Languages** (stacked bar + 2-column legend using GitHub's per-language colors: Rust tan, Python blue, JS yellow, CSS purple, Shell green; graceful "no data" fallbacks in live mode).
-- **Run detail** (snackbar + side-nav shell, user-directed 2026-07-05, superseding the banded layouts): NO band, NO top nav — the page reclaims full viewport width. A slim sticky **snackbar** (dark, ~44px) carries: ← back button (history.back, falls back to index), a lime square home link, small status pill, commit-message title, condensed mono meta (`pipeline #id · sha · by author · via trigger · age · duration`), and the mode chip on the right (read-only — retry/trigger buttons were removed 2026-07-14). Below, a `236px / 1fr` **shell**: sticky left nav with **Overview** and **Pipeline file** (filename right-aligned) on top, then a small-caps **Stages** group where **each stage's jobs nest beneath it** inside a hairline tree rail — stage items show a passed-count (`2/2`); job sub-items are two-line — name with right-aligned mono duration over a truncated muted `$ command` (full command as tooltip). The **Pipeline file view** renders the repo's yaml in a dark island with line numbers and a hand-rolled highlighter (`lib/yamlhl.ts`: keys lime, strings/flow-seqs green, numbers/booleans amber, comments dim italic, `script: |` block bodies kept one color); the flow card's filename button jumps to it. Stats live in the pages, not the nav: the **Overview view opens with a stat-well strip** (DURATION · JOBS `3/6 · 1 failed` with failures red · STAGES · WORKERS) above the flow canvas. **Stage click** → the `1fr / 300px` row shows worker-utilization charts **scoped to the stage's own window** (axes relative to stage start) beside a **stage details card** (name + status pill, small-caps rows: jobs passed, duration, "starts at +Ns into the run", workers, "failed at" button that opens the failing job's log view) plus every job's full terminal below (tinted lines, `open` link per terminal). **Job click** → a `1fr / 300px` **job shell**: a full-height **step terminal** (min 480px / `100vh − 250px`) beside a **job details card** (status pill, stage, worker, duration, "started +Ns into the run", exit code red when non-zero, needs, worker tags, artifacts with uploaded ✓, the command as a scrollable mono block, and an "← all of <stage>" escape). The terminal breaks the log into **steps**: the executor runs scripts through `sh -x`, and `lib/logsteps.ts` splits on the `+ cmd` trace markers — each step renders a sticky header row (chevron, step number chip, lime `$ command`, right-aligned line count) over its own output lines; the last step of a failed job gets a red header. Head toolbar (dark `.ttool` buttons): steps/raw toggle, collapse/expand all, follow, wrap, copy. Lines keep raw log numbering and are keyword-tinted by `classify()` — errors red, warnings amber, successes green, `[executor]` lines dim italic, `+ cmd` lines lime in raw mode. Logs from before the tracing change fall back to a flat listing automatically. Deep-linkable via `run.html?id=N&job=M`; follow-tail auto-disengages when the user scrolls up. The **Overview** view holds (1) the **pannable/zoomable flow canvas** (drag to pan with click-guard, ctrl/cmd+scroll cursor-anchored zoom, −/%/+/reset clamped 40–250%, dotted-grid stage, nodes select the job view in-page). The canvas is a real **DAG**: nodes sit on a computed grid (stage = column, 220×62 nodes), stage labels above each column, and **SVG bezier edges drawn from each job's `needs`** — colored by the dependency's status (olive-green passed, red failed, neutral otherwise), animated marching dashes into running jobs (static under reduced-motion). Hovering a node dims unrelated nodes/edges and thickens its own; node sub-lines show duration + worker, or `waiting on <deps>` while pending and (2) **Worker utilization** — one CPU-monitor-style chart card per participating worker (`drawUtilChart` in charts.js: 0/50/100% gridlines + y labels, x labels 0s/mid/total, olive line + translucent area of percent-busy per bucket across the run window; header shows dot, name, `jobs N · busy X% of run`). Timeline moved out pending future views; per-job forensics live in the job views.
-- **Monitor** (fleet-dashboard layout, user reference 2026-07-05): the band holds **Fleet utilization** — a 36-bucket bar histogram (div bars, bright green, height = busy workers; idle buckets render as tiny stubs) that explains itself: a head sub-label ("each bar = workers busy during a ~25s slice"), dashed capacity gridlines per worker with in-plot labels (1..N, topmost "all N busy"), an `active 2/5 ●` readout (fleet-size denominator to match the grid; lime pulsing dot when busy, muted when idle), a 15m/10m/5m/now axis, and a centered overlay when the whole window is quiet ("cluster idle — no jobs in the last 15 minutes · all workers online" / "· N workers offline") so idle reads healthy, not broken. The light area is a grid of **worker cards**: name + status badge (pulsing amber BUSY / neutral IDLE / red ⚠ OFFLINE), "last seen Ns ago" heartbeat line, then a state well — CURRENT JOB (name link + run/pipeline sub) when busy, red **RECENT FAILURE** well ("exit N in job · run #id · age", linked) when idle with a failure in the window, italic "standing by…" when quietly idle, dashed "no heartbeat for Nm — marked offline by the reaper" when offline — a segmented **15-minute timeline strip** (div segments positioned by interval: green ✓ passed, red ✕ failed, amber pulsing running; glyphs when wide enough, tooltips always), and a JOBS/PASS/FAIL/UTIL stat row (fail red only when non-zero). Footer is an honest status line: `api: ok (Nms) · mode · queue: N pending · auto-refresh: 3s` — no invented DB/CPU metrics. Redrawn every second; data derived exactly from job timestamps.
-- **Status**: inline `<glyph> <word>` pair, fixed colors above. Running pulses opacity (none under reduced-motion).
-- **Stage strip**: per-run micro visualization — one flat segment per job, 8px tall, colored by status; reads pass/fail shape at a glance.
-- **Runs table**: hairline-ruled rows; columns status / run·pipeline / commit (mono sha + message) / stages strip / duration / age. Whole row is a link.
-- **Timeline (run detail)**: stage-grouped horizontal duration bars on a shared time axis, pure CSS; worker name on each bar; running bar animates width.
-- **Log viewer** (inside the run page's job view — no standalone page): dark island, line numbers, mono, stderr lines tinted, follow-tail + wrap toggles, copy button; worker + job chip header, `$ command` + line count footer.
-- **Buttons**: 1 primary (olive fill, white text), quiet (hairline border). 6px radius. All states: hover, focus-visible ring, active, disabled.
-- **Empty states**: teach the API (`curl -X POST …/api/pipelines/trigger`).
+Shared, in `src/lib/components/`:
+
+- **AppShell** — sidebar (collapsible; collapsed, the mark becomes the toggle),
+  nav with live counts, status rail, ⌘K palette trigger. Owns the "Degraded"
+  determination.
+- **Palette** — native `<dialog>`, so focus trap, Escape and an inert backdrop
+  come from the platform rather than from hand-written key handlers.
+- **FlowCanvas** — the stage DAG, shared by Control center and Run detail so the
+  graph behaves identically wherever you meet it. Stage = column; edges are
+  bezier paths drawn from each job's `needs`, *not* from stage order, and are
+  coloured by the dependency's status. Drag to pan (with a drag-vs-click guard),
+  ⌘+scroll to zoom cursor-anchored, clamped 40–250%.
+- **FleetChart** — demand vs capacity as a step function, not bars. The metric is
+  a whole number of workers, and a step function is the honest mark type for a
+  quantity that changes at instants. Demand is derived from `ready_at →
+  finished_at`; capacity steps down when a worker is reaped; a saturation rail
+  marks exact ties.
+- **Calendar** — a year of daily counts. The shade scale is quartiles of the
+  busiest day rather than a fixed count, so a machine doing 2 jobs a day and one
+  doing 40 both produce a readable gradient. The legend names the busiest day so
+  the shading is anchored to a real number.
+- **OsLogo** — macOS / Windows / Ubuntu / Debian / Arch / Fedora / Alpine /
+  generic Tux, drawn inline. An unrecognised `os_id` gets initials, not a guessed
+  logo.
+- **FacetDropdown** — disables itself when there is only one option rather than
+  presenting a control that cannot do anything.
+- **Strip** — one segment per job, in plan order: a run's shape at table width.
+- **Sparkline** — trend only, scaled to its own min/max, since the headline
+  number beside it already carries the absolute value.
+
+## Page notes
+
+- **Control center** — four KPI tiles, a pipeline picker feeding the DAG canvas
+  (defaults to the newest running pipeline, falling back to the newest completed
+  one), a worker cluster table, four recent runs, and the fleet chart. It fits
+  one screen without scrolling, by design: it is a glimpse, and anything that
+  would need a "view all" link belongs on the page that link would point at.
+- **Runs** — status chips with counts, repo/trigger/when facets, search, a
+  query-scoped summary line, day grouping with sticky headers, the failing job's
+  distilled first error line inline, and attempt/requeue badges. Filter state
+  mirrors into the URL so any view is linkable. `↑↓` navigate, `⏎` opens, `/`
+  focuses search.
+- **Run detail** — three panes. Left: what the pipeline *is* — its file, its
+  stages, and the command each job runs (the command is under the name, because
+  a job is what it runs). Centre: what is *happening* — the DAG when nothing is
+  selected, that job's live log when something is. Right: the selected job's
+  facts and its siblings, so moving between jobs in a stage does not mean going
+  back to the tree. **Logs stream** (`lib/logstream.ts`) rather than poll: a
+  stage's output has to appear while the stage runs, not after it. The terminal
+  splits the log into steps on the `sh -x` `+ cmd` trace markers
+  (`lib/logsteps.ts`), each collapsible, with follow/wrap/copy.
+- **Repositories** — three levels behind one nav item. Repo cards carry a
+  language bar, contributors, pass rate and latest run. Pipeline cards derive
+  their stage chain from the most recent run. The pipeline's own run list carries
+  duration-vs-median bars, which are only meaningful there because repo and
+  pipeline are held constant.
+- **Workers** — a list where every column is live state, and a device page that
+  owns all the history. The spec block is a fastfetch-style dark panel at half
+  width that scrolls inside itself, with the contribution calendar beside it, so
+  a machine reporting more rows cannot shove the calendar off screen.
+- **Insights** — every panel states its question in the header and ends with the
+  answer. Run activity leads, because everything below is a claim about a window
+  and that panel shows what the window contains. The rest: where the time goes
+  (per-stage wall time, median behind p90), flaky jobs (both outcomes on the
+  *same* commit — anything else is the code, not the job), duration trend
+  (p50 vs p90), queue wait vs execution (more workers or faster ones?), worker
+  skew for the busiest job, and failures ranked by cause.
+- **404** — a broken-pipeline diagram that names the route that failed.
 
 ## Motion
 
-150–250ms, ease-out. Only state changes: running pulse, bar width growth, row hover, readout tick. No entrance choreography. `prefers-reduced-motion`: pulses become static, transitions instant.
+150–250ms, ease-out, state changes only: the running pulse, the streaming-log
+cursor, bar-width growth, row hover. No entrance choreography. The sidebar width
+is switched rather than animated — tweening it would reflow the DAG canvas and
+every chart on each frame.

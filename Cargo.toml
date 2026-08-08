@@ -9,6 +9,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "json"] }
 tempfile = "3"
+futures = "0.3"
 clap = { version = "4.6.1", features = ["derive"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -17,3 +18,4 @@ tokio = { version = "1.52.3", features = ["full"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.38.4"
+ratatui = "0.30.2"

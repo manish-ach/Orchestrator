@@ -5,7 +5,7 @@
 
 use reqwest::Client;
 use serde_json::Value;
-use crate::types::{Contributor, LanguageShare, PipelineRef, Repo};
+use crate::types::{Contributor, LanguageShare, PipelineJobRef, PipelineRef, Repo};
 
 /// Files probed on the default branch to detect a pipeline definition,
 /// in priority order.
@@ -102,13 +102,29 @@ pub async fn fetch_repo(client: &Client, remote: &str) -> Result<Repo, String> {
     // name the pipeline after the YAML's `name:` so runs (created from the
     // same file) group under it in the dashboard's pipeline switcher
     let branch = info["default_branch"].as_str().unwrap_or("main");
+    // Every candidate file, not just the first: a repo with both a ci.yml and
+    // a nightly.yml has two pipelines, and stopping at one hid the second
+    // until it happened to run.
     let mut pipelines: Vec<PipelineRef> = Vec::new();
     for file in PIPELINE_FILES {
-        if let Some(yaml) = fetch_raw_file(client, remote, branch, file).await {
-            let name = crate::pipeline::yaml_pipeline_name(&yaml).unwrap_or_else(|| format!("{}-ci", r.name));
-            pipelines.push(PipelineRef { name, file: file.to_string() });
-            break;
-        }
+        let Some(yaml) = fetch_raw_file(client, remote, branch, file).await else { continue };
+        let name = crate::pipeline::yaml_pipeline_name(&yaml).unwrap_or_else(|| format!("{}-ci", r.name));
+        // Planned through the real parser rather than a local guess, so the
+        // shape shown here is exactly the shape that will run — and a file that
+        // does not validate says so instead of rendering half a graph.
+        let (stages, jobs, parse_error) = match crate::pipeline::plan_from_yaml(&yaml).await {
+            Ok(plan) => (
+                plan.stages,
+                plan.jobs
+                    .into_iter()
+                    .map(|j| PipelineJobRef { name: j.name, stage: j.stage, needs: j.needs, tags: j.tags })
+                    .collect(),
+                None,
+            ),
+            Err(e) => (Vec::new(), Vec::new(), Some(e)),
+        };
+        let schedule = crate::pipeline::yaml_schedule(&yaml);
+        pipelines.push(PipelineRef { name, file: file.to_string(), stages, jobs, parse_error, schedule });
     }
 
     Ok(Repo {
@@ -126,6 +142,8 @@ pub async fn fetch_repo(client: &Client, remote: &str) -> Result<Repo, String> {
         languages,
         contributors,
         pipelines,
+        // joined in by the store on read, not sourced from Forgejo
+        webhook: None,
     })
 }
 

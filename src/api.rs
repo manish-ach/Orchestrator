@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
+use axum::response::sse::{self, Sse};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -12,7 +13,7 @@ use crate::pipeline::{self, Plan};
 use crate::store::SharedStore;
 use crate::types::{
     AddRepoRequest, CalendarDay, ClaimedJob, Commit, HealthReport, Job, RegisterResponse, Repo, ReportRequest, Run,
-    TriggerKind, TriggerRequest, Worker, WorkerRequest, WorkerStatsSeries,
+    TriggerKind, TriggerRequest, Worker, WorkerActivity, WorkerRequest, WorkerStatsSeries,
 };
 
 type ApiError = (StatusCode, String);
@@ -57,15 +58,18 @@ pub fn router(store: SharedStore) -> Router {
     let dashboard = Router::new()
         .route("/api/workers", get(list_workers))
         .route("/api/workers/stats", get(worker_stats))
+        .route("/api/workers/{name}/activity", get(worker_activity))
         .route("/api/pipelines/trigger", post(trigger_pipeline))
         .route("/api/jobs", get(list_jobs))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/jobs/{id}/logs", get(job_logs))
+        .route("/api/jobs/{id}/logs/stream", get(job_log_stream))
         .route("/api/repos", get(list_repos).post(add_repo))
         .route("/api/repos/{name}", delete(delete_repo))
         .route("/api/repos/{name}/pipeline", get(pipeline_file))
         .route("/api/activity/calendar", get(calendar))
+        .route("/api/insights", get(insights))
         .route_layer(middleware::from_fn_with_state(store.clone(), require_session));
 
     let router = Router::new()
@@ -143,18 +147,32 @@ async fn worker_stats(State(store): State<SharedStore>) -> Result<Json<Vec<Worke
     Ok(Json(store.worker_stats().await.map_err(internal)?))
 }
 
+/// What one machine has done: its job history, calendar and totals. Answers
+/// for a name with no jobs rather than 404ing — a worker that has registered
+/// but not yet run anything is a real, empty state the page must show.
+async fn worker_activity(
+    State(store): State<SharedStore>,
+    Path(name): Path<String>,
+) -> Result<Json<WorkerActivity>, ApiError> {
+    Ok(Json(store.worker_activity(&name).await.map_err(internal)?))
+}
+
 async fn register(
     State(store): State<SharedStore>,
     Json(req): Json<WorkerRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
     let worker_id = store
-        .register(&req.worker_name, req.worker_id.clone(), &req.tags)
+        .register(&req.worker_name, req.worker_id.clone(), &req.tags, req.device.clone())
         .await
         .map_err(internal)?;
     println!(
-        "Worker {} registered as {worker_id}{}",
+        "Worker {} registered as {worker_id}{}{}",
         req.worker_name,
-        if req.tags.is_empty() { String::new() } else { format!(" (tags: {})", req.tags.join(", ")) }
+        if req.tags.is_empty() { String::new() } else { format!(" (tags: {})", req.tags.join(", ")) },
+        req.device
+            .as_ref()
+            .map(|d| format!(" [{} · {} cores]", d.os.as_deref().unwrap_or(&d.os_id), d.cpu_cores))
+            .unwrap_or_default()
     );
     Ok(Json(RegisterResponse { worker_id }))
 }
@@ -282,20 +300,55 @@ async fn trigger_pipeline(
 
     let env = run_env(src.remote.as_deref(), &src.branch, None);
     let id = store
-        .create_run(&src.plan.name, &src.repo, &src.file, TriggerKind::Manual, None, &env, &src.plan)
+        .create_run(&src.plan.name, &src.repo, &src.file, TriggerKind::Manual, &src.branch, None, &env, &src.plan)
         .await
         .map_err(internal)?;
     println!("Triggered run {id}: pipeline '{}' from {} ({} jobs)", src.plan.name, src.file, src.plan.jobs.len());
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
+/// Start a run from a pipeline's `schedule:`. Shares the whole path a webhook
+/// takes — same planner, same env injection — so a scheduled run differs from
+/// a pushed one only in its trigger kind and in having no commit attached.
+pub async fn start_scheduled_run(
+    store: &SharedStore,
+    repo: &Repo,
+    pipeline: &crate::types::PipelineRef,
+) -> Result<i64, String> {
+    let branch = repo.branch.clone();
+    let yaml = forgejo::fetch_raw_file(
+        &reqwest::Client::new(),
+        repo.remote.as_deref().ok_or("repo has no remote")?,
+        &branch,
+        &pipeline.file,
+    )
+    .await
+    .ok_or_else(|| format!("{} is gone from {branch}", pipeline.file))?;
+    let plan = pipeline::plan_from_yaml(&yaml).await?;
+
+    // No commit: a schedule fires against whatever is on the branch, and
+    // inventing a sha here would put a lie in the run's history.
+    let env = run_env(repo.remote.as_deref(), &branch, None);
+    store
+        .create_run(&plan.name, &repo.name, &pipeline.file, TriggerKind::Schedule, &branch, None, &env, &plan)
+        .await
+}
+
 /// Forgejo push webhook. Point the repo's webhook at
 /// POST http://<coordinator>/api/webhooks/forgejo (content type JSON).
 async fn forgejo_webhook(
     State(store): State<SharedStore>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use serde_json::Value;
+
+    let event = headers
+        .get("x-forgejo-event")
+        .or_else(|| headers.get("x-gitea-event"))
+        .or_else(|| headers.get("x-github-event"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     let full_name = payload
         .pointer("/repository/full_name")
@@ -361,10 +414,22 @@ async fn forgejo_webhook(
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let (plan, file) = plan_for_repo(&repo, &branch).await?;
+    // Record the delivery before doing anything that can fail, so a repo whose
+    // pipeline file is broken still shows "the hook works, the file does not"
+    // rather than looking like nothing ever arrived.
+    let plan_result = plan_for_repo(&repo, &branch).await;
+    let outcome = match &plan_result {
+        Ok(_) => ("accepted", None),
+        Err((_, why)) => ("rejected", Some(why.as_str())),
+    };
+    if let Err(e) = store.record_delivery(&repo.name, event.as_deref(), outcome.0, outcome.1).await {
+        // never fail a webhook over bookkeeping — the run matters more
+        eprintln!("could not record webhook delivery for {}: {e}", repo.name);
+    }
+    let (plan, file) = plan_result?;
     let env = run_env(repo.remote.as_deref(), &branch, full_sha.as_deref());
     let id = store
-        .create_run(&plan.name, &repo.name, &file, TriggerKind::Webhook, commit.as_ref(), &env, &plan)
+        .create_run(&plan.name, &repo.name, &file, TriggerKind::Webhook, &branch, commit.as_ref(), &env, &plan)
         .await
         .map_err(internal)?;
     println!(
@@ -473,6 +538,77 @@ async fn job_logs(
     Ok(Json(serde_json::json!({ "output": output })))
 }
 
+/// How often the log stream looks for new output. The executor posts its
+/// growing log roughly every two seconds, so polling faster than this buys
+/// nothing; polling slower makes a live log feel like a page refresh.
+const LOG_POLL_MS: u64 = 400;
+
+/// Server-sent events carrying a job's log as it is written.
+///
+/// Deliberately a poll over the store rather than a broadcast channel fed by
+/// `job_progress`: the log has two possible writers (the worker forwarding its
+/// executor's tail, or the executor posting straight here), and a channel would
+/// only see one of them. Reading the row is the one place both agree.
+///
+/// Each event carries only the bytes since the last one, so a long build does
+/// not resend its whole log every tick. The stream closes itself once the job
+/// reaches a terminal state and its last bytes have gone out.
+async fn job_log_stream(
+    Path(id): Path<i64>,
+    State(store): State<SharedStore>,
+) -> Sse<impl futures::Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
+    struct S {
+        store: SharedStore,
+        id: i64,
+        sent: usize,
+        first: bool,
+        finished: bool,
+    }
+
+    let stream = futures::stream::unfold(
+        S { store, id, sent: 0, first: true, finished: false },
+        |mut s| async move {
+            if s.finished {
+                return None;
+            }
+            if s.first {
+                s.first = false;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(LOG_POLL_MS)).await;
+            }
+
+            let Ok(Some((output, done))) = s.store.job_tail(s.id).await else {
+                // a job that vanished (or a database blip) ends the stream
+                // rather than spinning: the client falls back to polling
+                s.finished = true;
+                return Some((Ok(sse::Event::default().event("end").data("gone")), s));
+            };
+
+            // `get` rather than indexing: a rewritten log can leave the mark
+            // inside a multi-byte character, and slicing there would panic
+            let chunk = output.get(s.sent..).unwrap_or("").to_string();
+            s.sent = output.len();
+
+            if done {
+                s.finished = true;
+                if chunk.is_empty() {
+                    return Some((Ok(sse::Event::default().event("end").data("done")), s));
+                }
+            }
+            let event = if chunk.is_empty() {
+                // an empty comment keeps the connection warm without the
+                // client having to distinguish "no news" from "new blank line"
+                sse::Event::default().comment("idle")
+            } else {
+                sse::Event::default().event("log").data(chunk)
+            };
+            Some((Ok(event), s))
+        },
+    );
+
+    Sse::new(stream).keep_alive(sse::KeepAlive::default())
+}
+
 async fn list_repos(State(store): State<SharedStore>) -> Result<Json<Vec<Repo>>, ApiError> {
     Ok(Json(store.list_repos().await.map_err(internal)?))
 }
@@ -545,6 +681,23 @@ async fn pipeline_file(
         StatusCode::NOT_FOUND,
         format!("no pipeline file found on '{}' — push .orchestrator/actions.yml first", repo.branch),
     ))
+}
+
+/// Everything the Insights page shows, for one window. `range` is a day count;
+/// anything outside 1..=365 is clamped rather than rejected, since a bad query
+/// string should not blank the page.
+#[derive(serde::Deserialize)]
+struct InsightsQuery {
+    #[serde(default)]
+    range: Option<i64>,
+}
+
+async fn insights(
+    State(store): State<SharedStore>,
+    Query(q): Query<InsightsQuery>,
+) -> Result<Json<crate::insights::Insights>, ApiError> {
+    let days = q.range.unwrap_or(30).clamp(1, 365);
+    Ok(Json(store.insights(days).await.map_err(internal)?))
 }
 
 async fn calendar(State(store): State<SharedStore>) -> Result<Json<Vec<CalendarDay>>, ApiError> {

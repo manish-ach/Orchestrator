@@ -118,6 +118,19 @@ Jobs claimed by that worker run as plain subprocesses on that machine, in a
 workspace cloned from the pushed commit; artifacts still travel through the
 coordinator, so `needs` works across machines.
 
+### Worker output
+
+A worker on a terminal gets the full-screen dashboard; anywhere else it prints
+plain timestamped lines. That decision is made from whether stdout is a tty, so
+a systemd unit or container needs no extra flag:
+
+    cargo run --release -- worker --name macbook            # dashboard on a laptop
+    cargo run --release -- worker --name srv-1 --no-tui     # force plain lines
+    cargo run --release -- worker --name srv-1 --tui        # force the dashboard
+
+`--no-tui` matters when a wrapper still gives you a tty but you want the log
+form — the server's own worker, for instance, alongside the coordinator.
+
 ### Job placement (pins and tags)
 
 Machine-specific jobs (like `self-deploy`, which needs the server's docker
@@ -141,6 +154,27 @@ capability tags. Start capable workers with labels:
 A tagged job only runs on an online worker carrying **all** of its tags
 (idle workers are preferred); if none is online it waits in the queue until
 one appears. Untagged jobs land in the global queue, first free worker wins.
+
+## Scheduled pipelines
+
+Give a pipeline file a top-level `schedule:` and the coordinator runs it on that
+cron, no push required:
+
+    name: nightly
+    schedule: "0 2 * * *"    # min hour day-of-month month day-of-week
+    jobs:
+      ...
+
+Five standard fields, with `*`, `n`, `a-b`, `a,b,c`, `*/n` and `a-b/n`. When
+both day fields are restricted they are ORed, as every crontab does:
+`0 0 13 * 5` means "the 13th, and every Friday", not "Friday the 13th".
+
+The scheduler ticks on the minute and claims each firing in Postgres before
+running it, so restarting the coordinator mid-minute cannot double-fire and two
+coordinators against one database cannot both win. A schedule that does not
+parse is reported in the log rather than silently never running. Scheduled runs
+build the repo's default branch and carry no commit, since a schedule fires
+against whatever is on the branch.
 
 ## Dashboard login
 

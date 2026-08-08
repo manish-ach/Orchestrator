@@ -16,10 +16,11 @@ use redis::AsyncCommands;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
+use crate::insights;
 use crate::pipeline::Plan;
 use crate::types::{
-    CalendarDay, ClaimedJob, Commit, Job, JobStatus, Repo, ReportRequest, Run, StatSample, Status, TriggerKind,
-    Worker, WorkerStats, WorkerStatsSeries,
+    CalendarDay, ClaimedJob, Commit, DeviceProfile, Job, JobStatus, Repo, ReportRequest, Run, StatSample, Status,
+    TriggerKind, WebhookDelivery, Worker, WorkerActivity, WorkerJob, WorkerStats, WorkerStatsSeries,
 };
 
 pub type SharedStore = Arc<Store>;
@@ -84,9 +85,51 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS queued_for TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS artifacts JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS has_artifacts BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+-- When the job first became runnable (all `needs` passed and a placement was
+-- found). `started_at - ready_at` is the queue wait, which is otherwise
+-- unrecoverable: nothing else records when a job *could* have started, and a
+-- requeue clears started_at. Set once and never overwritten, so a job that
+-- waited, got orphaned and waited again reports the total.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ready_at BIGINT;
+-- How many times a worker died mid-job and the reconciler handed it back.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS requeue_count INT NOT NULL DEFAULT 0;
+-- The one line worth showing next to a failure. Extracted once on report so the
+-- run list can say *why* something broke without shipping whole build logs:
+-- list queries deliberately omit `output`, which is megabytes per response once
+-- real cargo builds are involved.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS first_error TEXT;
+-- Backfill: the cause was always in `output`, it just was never distilled.
+-- Rough (first matching line, SQL-side) but it means old failures are not blank.
+UPDATE jobs SET first_error = LEFT((
+    SELECT l FROM regexp_split_to_table(output, E'\n') AS l
+    WHERE l ~* '(error|panicked|fatal|exception|traceback|failed)'
+    LIMIT 1), 200)
+WHERE status = 'failed' AND first_error IS NULL AND output IS NOT NULL;
+-- Which branch the run built. Known at ingest (the webhook's `refs/heads/…`)
+-- and already injected into every job as REPO_BRANCH, but it was never kept on
+-- the run itself, so nothing could group or filter by it after the fact. Not
+-- backfillable: the push payload is long gone.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS branch TEXT;
 CREATE TABLE IF NOT EXISTS repos (
     remote TEXT PRIMARY KEY,
     data   JSONB NOT NULL
+);
+-- Proof that a repo's webhook reaches us. Its own table rather than a field on
+-- `repos.data`, because that blob is overwritten wholesale by the Forgejo
+-- refresh every two minutes and would take this with it.
+-- One row per scheduled pipeline, holding the minute it last fired. The
+-- scheduler claims a minute with a conditional UPDATE, so a coordinator
+-- restart mid-minute cannot double-fire and two coordinators cannot both win.
+CREATE TABLE IF NOT EXISTS schedule_state (
+    key        TEXT PRIMARY KEY,
+    last_fired BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    repo    TEXT PRIMARY KEY,
+    last_at BIGINT NOT NULL,
+    event   TEXT,
+    status  TEXT NOT NULL,
+    detail  TEXT
 );
 "#;
 
@@ -107,6 +150,9 @@ struct WorkerRecord {
     /// latest machine stats from the heartbeat
     #[serde(default)]
     stats: Option<WorkerStats>,
+    /// what machine this is, from the last register
+    #[serde(default)]
+    device: Option<DeviceProfile>,
 }
 
 pub struct Store {
@@ -145,14 +191,23 @@ impl Store {
     /// carrying the same name are dropped — a container that lost its id
     /// file re-registers as a "new" worker, and without this the registry
     /// fills with dead duplicates that break the dashboard.
-    pub async fn register(&self, name: &str, id: Option<String>, tags: &[String]) -> Result<String, String> {
+    pub async fn register(
+        &self,
+        name: &str,
+        id: Option<String>,
+        tags: &[String],
+        device: Option<DeviceProfile>,
+    ) -> Result<String, String> {
         let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let registered_at = self
-            .get_worker(&id)
-            .await?
+        let prior = self.get_worker(&id).await?;
+        let registered_at = prior
+            .as_ref()
             .map(|rec| rec.registered_at)
             .filter(|&t| t > 0)
             .unwrap_or_else(now_ms);
+        // an agent too old to send a profile must not erase the one an older
+        // registration already recorded for this same machine
+        let device = device.or_else(|| prior.and_then(|rec| rec.device));
 
         let mut r = self.redis.clone();
         let now = now_ms();
@@ -175,6 +230,7 @@ impl Store {
             tags: tags.to_vec(),
             job_id: None,
             stats: None,
+            device,
         })
         .unwrap();
         let _: () = r.hset(WORKERS_KEY, &id, rec).await.map_err(|e| e.to_string())?;
@@ -247,6 +303,7 @@ impl Store {
                     tags: rec.tags,
                     job_id: rec.job_id,
                     stats: rec.stats,
+                    device: rec.device,
                 })
             })
             .collect();
@@ -311,6 +368,7 @@ impl Store {
         repo: &str,
         pipeline_file: &str,
         trigger: TriggerKind,
+        branch: &str,
         commit: Option<&Commit>,
         // injected into every job's env (REPO_URL, REPO_BRANCH, COMMIT_SHA)
         // so pipelines can `git clone $REPO_URL` instead of hardcoding it;
@@ -320,13 +378,15 @@ impl Store {
     ) -> Result<i64, String> {
         let now = now_ms();
         let run_id: i64 = sqlx::query_scalar(
-            "INSERT INTO runs (pipeline, repo, pipeline_file, trigger_kind, commit_info, status, created_at, started_at)
-             VALUES ($1, $2, $3, $4, $5, 'pending', $6, $6) RETURNING id",
+            "INSERT INTO runs (pipeline, repo, pipeline_file, trigger_kind, branch, commit_info,
+                               status, created_at, started_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $7) RETURNING id",
         )
         .bind(pipeline)
         .bind(repo)
         .bind(pipeline_file)
         .bind(trigger.as_str())
+        .bind(branch)
         .bind(commit.map(|c| serde_json::to_value(c).unwrap()))
         .bind(now)
         .fetch_one(&self.db)
@@ -435,11 +495,15 @@ impl Store {
             // conditional flip: two report_job calls can race into
             // enqueue_ready for the same run — only the one that wins this
             // row update may push, or the job would execute twice
+            // COALESCE keeps the first ready time across requeues, so the wait
+            // reported is the total a job spent runnable-but-unstarted.
             let res = sqlx::query(
-                "UPDATE jobs SET queued = TRUE, queued_for = $2 WHERE id = $1 AND queued = FALSE AND status = 'pending'",
+                "UPDATE jobs SET queued = TRUE, queued_for = $2, ready_at = COALESCE(ready_at, $3)
+                 WHERE id = $1 AND queued = FALSE AND status = 'pending'",
             )
             .bind(id)
             .bind(&target)
+            .bind(now_ms())
             .execute(&self.db)
             .await
             .map_err(|e| e.to_string())?;
@@ -558,9 +622,12 @@ impl Store {
                 None => true,
             };
             if orphaned {
+                // ready_at deliberately survives: the job was runnable before
+                // the worker died and is runnable again, so the wait continues.
                 sqlx::query(
                     "UPDATE jobs SET status = 'pending', queued = FALSE, queued_for = NULL,
-                     worker = NULL, worker_id = NULL, started_at = NULL WHERE id = $1",
+                     worker = NULL, worker_id = NULL, started_at = NULL,
+                     requeue_count = requeue_count + 1 WHERE id = $1",
                 )
                 .bind(row.get::<i64, _>("id"))
                 .execute(&self.db)
@@ -590,8 +657,12 @@ impl Store {
     }
 
     pub async fn report_job(&self, job_id: i64, req: &ReportRequest) -> Result<(), String> {
+        let first_error = matches!(req.status, JobStatus::Failed)
+            .then(|| first_error_line(&req.output))
+            .flatten();
         let row = sqlx::query(
-            "UPDATE jobs SET status = $2, output = $3, exit_code = $4, finished_at = $5 WHERE id = $1
+            "UPDATE jobs SET status = $2, output = $3, exit_code = $4, finished_at = $5,
+             first_error = $6 WHERE id = $1
              RETURNING run_id, worker_id",
         )
         .bind(job_id)
@@ -599,6 +670,7 @@ impl Store {
         .bind(&req.output)
         .bind(req.exit_code)
         .bind(now_ms())
+        .bind(&first_error)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| e.to_string())?;
@@ -709,7 +781,7 @@ impl Store {
         }
 
         let ids: Vec<i64> = runs.iter().map(|r| r.id).collect();
-        let job_rows = sqlx::query("SELECT * FROM jobs WHERE run_id = ANY($1) ORDER BY id")
+        let job_rows = sqlx::query("SELECT id, run_id, stage, name, command, needs, env, queued, status, worker, worker_id, ready_at, requeue_count, started_at, finished_at, exit_code, first_error, artifacts, has_artifacts, tags FROM jobs WHERE run_id = ANY($1) ORDER BY id")
             .bind(&ids)
             .fetch_all(&self.db)
             .await
@@ -743,7 +815,7 @@ impl Store {
     }
 
     pub async fn list_jobs(&self) -> Result<Vec<Job>, String> {
-        let rows = sqlx::query("SELECT * FROM jobs ORDER BY id")
+        let rows = sqlx::query("SELECT id, run_id, stage, name, command, needs, env, queued, status, worker, worker_id, ready_at, requeue_count, started_at, finished_at, exit_code, first_error, artifacts, has_artifacts, tags FROM jobs ORDER BY id")
             .fetch_all(&self.db)
             .await
             .map_err(|e| e.to_string())?;
@@ -761,6 +833,22 @@ impl Store {
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// A job's log so far plus whether it can still grow. The log stream polls
+    /// this: `done` is what tells the stream to close rather than hold a
+    /// connection open forever on a job that finished minutes ago.
+    pub async fn job_tail(&self, job_id: i64) -> Result<Option<(String, bool)>, String> {
+        let row = sqlx::query("SELECT output, status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.map(|r| {
+            let status = JobStatus::from_str(r.get("status"));
+            let done = matches!(status, JobStatus::Passed | JobStatus::Failed);
+            (r.get::<Option<String>, _>("output").unwrap_or_default(), done)
+        }))
     }
 
     pub async fn job_output(&self, job_id: i64) -> Result<Option<String>, String> {
@@ -803,6 +891,9 @@ impl Store {
 
     pub async fn upsert_repo(&self, repo: &Repo) -> Result<(), String> {
         let Some(remote) = &repo.remote else { return Ok(()) };
+        // Delivery state is joined in on read and must not ride along into the
+        // blob: this write is the refresh that would otherwise stale it.
+        let repo = &Repo { webhook: None, ..repo.clone() };
         sqlx::query(
             "INSERT INTO repos (remote, data) VALUES ($1, $2)
              ON CONFLICT (remote) DO UPDATE SET data = EXCLUDED.data",
@@ -820,10 +911,81 @@ impl Store {
             .fetch_all(&self.db)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(rows
+        let mut repos: Vec<Repo> = rows
             .into_iter()
             .filter_map(|r| serde_json::from_value(r.get::<serde_json::Value, _>("data")).ok())
-            .collect())
+            .collect();
+
+        let deliveries = sqlx::query("SELECT repo, last_at, event, status, detail FROM webhook_deliveries")
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        let by_repo: HashMap<String, WebhookDelivery> = deliveries
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("repo"),
+                    WebhookDelivery {
+                        last_at: r.get("last_at"),
+                        event: r.get("event"),
+                        status: r.get("status"),
+                        detail: r.get("detail"),
+                    },
+                )
+            })
+            .collect();
+        for repo in &mut repos {
+            repo.webhook = by_repo.get(&repo.name).cloned();
+        }
+        Ok(repos)
+    }
+
+    /// Claim `minute` for a scheduled pipeline, returning true exactly once
+    /// across every coordinator that asks.
+    ///
+    /// The whole guard is the `WHERE last_fired < $2` on the upsert: whoever
+    /// commits first moves the watermark, and everyone else affects zero rows.
+    /// Without it a restart at 02:00:30 would run the 02:00 job a second time.
+    pub async fn claim_schedule(&self, key: &str, minute: i64) -> Result<bool, String> {
+        let res = sqlx::query(
+            "INSERT INTO schedule_state (key, last_fired) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET last_fired = EXCLUDED.last_fired
+             WHERE schedule_state.last_fired < $2",
+        )
+        .bind(key)
+        .bind(minute)
+        .execute(&self.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Record that a push arrived for `repo`. Called for accepted *and*
+    /// rejected deliveries: a rejection still proves the hook is wired up, and
+    /// which kind it was is the whole diagnostic.
+    pub async fn record_delivery(
+        &self,
+        repo: &str,
+        event: Option<&str>,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (repo, last_at, event, status, detail)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (repo) DO UPDATE SET
+               last_at = EXCLUDED.last_at, event = EXCLUDED.event,
+               status  = EXCLUDED.status,  detail = EXCLUDED.detail",
+        )
+        .bind(repo)
+        .bind(now_ms())
+        .bind(event)
+        .bind(status)
+        .bind(detail)
+        .execute(&self.db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub async fn repo_remotes(&self) -> Result<Vec<String>, String> {
@@ -865,7 +1027,6 @@ impl Store {
     // ---- calendar -------------------------------------------------------
 
     pub async fn calendar(&self) -> Result<Vec<CalendarDay>, String> {
-        use chrono::{Duration, TimeZone};
         let starts: Vec<i64> = sqlx::query("SELECT started_at FROM runs")
             .fetch_all(&self.db)
             .await
@@ -874,22 +1035,168 @@ impl Store {
             .map(|r| r.get::<i64, _>("started_at"))
             .collect();
 
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        for ms in starts {
-            if let Some(d) = Local.timestamp_millis_opt(ms).single() {
-                *counts.entry(d.format("%Y-%m-%d").to_string()).or_default() += 1;
-            }
-        }
-        let today = Local::now().date_naive();
-        Ok((0..364)
-            .rev()
-            .map(|i| {
-                let date = (today - Duration::days(i)).format("%Y-%m-%d").to_string();
-                let count = counts.get(&date).copied().unwrap_or(0);
-                CalendarDay { date, count }
-            })
-            .collect())
+        Ok(calendar_from(starts))
     }
+
+    /// Everything the per-device page shows about what a machine has done.
+    ///
+    /// Scoped by worker NAME, so a box that lost its id file and re-registered
+    /// keeps its history — to the person reading the page it is one machine.
+    pub async fn worker_activity(&self, name: &str) -> Result<WorkerActivity, String> {
+        let rows = sqlx::query(
+            "SELECT j.id, j.run_id, j.stage, j.name, j.status, j.started_at, j.finished_at,
+                    r.repo, r.pipeline
+             FROM jobs j JOIN runs r ON r.id = j.run_id
+             WHERE j.worker = $1 AND j.started_at IS NOT NULL
+             ORDER BY j.started_at DESC",
+        )
+        .bind(name)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let jobs: Vec<WorkerJob> = rows
+            .into_iter()
+            .map(|r| WorkerJob {
+                job_id: r.get("id"),
+                run_id: r.get("run_id"),
+                repo: r.get("repo"),
+                pipeline: r.get("pipeline"),
+                stage: r.get("stage"),
+                name: r.get("name"),
+                status: JobStatus::from_str(r.get("status")),
+                started_at: r.get("started_at"),
+                finished_at: r.get("finished_at"),
+            })
+            .collect();
+
+        let passed = jobs.iter().filter(|j| j.status == JobStatus::Passed).count() as i64;
+        let failed = jobs.iter().filter(|j| j.status == JobStatus::Failed).count() as i64;
+        // only finished jobs have a duration; a job still running would
+        // otherwise drag the median toward zero as it is counted at 0ms
+        let mut durations: Vec<i64> = jobs
+            .iter()
+            .filter_map(|j| match (j.started_at, j.finished_at) {
+                (Some(s), Some(f)) if f >= s => Some(f - s),
+                _ => None,
+            })
+            .collect();
+        let busy_ms = durations.iter().sum();
+        durations.sort_unstable();
+        let median_ms = durations.get(durations.len() / 2).copied();
+
+        Ok(WorkerActivity {
+            name: name.to_string(),
+            calendar: calendar_from(jobs.iter().filter_map(|j| j.started_at).collect()),
+            total_jobs: jobs.len() as i64,
+            passed,
+            failed,
+            busy_ms,
+            median_ms,
+            recent: jobs.into_iter().take(40).collect(),
+        })
+    }
+}
+
+impl Store {
+    /// The Insights window: every job in the last `range_days`, flattened with
+    /// its run. One join rather than eight aggregate queries — the derivation
+    /// lives in `insights` as pure functions, which is where it can be tested.
+    /// `output` is excluded; nothing on that page reads a build log.
+    pub async fn insights(&self, range_days: i64) -> Result<insights::Insights, String> {
+        let now = now_ms();
+        let from = now - range_days * 24 * 60 * 60 * 1000;
+        let rows = sqlx::query(
+            "SELECT j.run_id, j.stage, j.name AS job_name, j.status AS job_status,
+                    j.ready_at, j.started_at, j.finished_at, j.exit_code, j.first_error, j.worker,
+                    r.pipeline, r.repo, r.commit_info, r.status AS run_status,
+                    r.started_at AS run_started_at, r.finished_at AS run_finished_at
+             FROM jobs j JOIN runs r ON r.id = j.run_id
+             WHERE r.started_at >= $1
+             ORDER BY r.started_at",
+        )
+        .bind(from)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let rows: Vec<insights::Row> = rows
+            .into_iter()
+            .map(|r| insights::Row {
+                run_id: r.get("run_id"),
+                pipeline: r.get("pipeline"),
+                repo: r.get("repo"),
+                commit_sha: r
+                    .get::<Option<serde_json::Value>, _>("commit_info")
+                    .and_then(|v| serde_json::from_value::<Commit>(v).ok())
+                    .map(|c| c.sha),
+                run_status: JobStatus::from_str(r.get("run_status")),
+                run_started_at: r.get("run_started_at"),
+                run_finished_at: r.get("run_finished_at"),
+                stage: r.get("stage"),
+                job_name: r.get("job_name"),
+                job_status: JobStatus::from_str(r.get("job_status")),
+                ready_at: r.get("ready_at"),
+                started_at: r.get("started_at"),
+                finished_at: r.get("finished_at"),
+                exit_code: r.get("exit_code"),
+                first_error: r.get("first_error"),
+                worker: r.get("worker"),
+            })
+            .collect();
+
+        Ok(insights::build(&rows, range_days, now, self.calendar().await?))
+    }
+}
+
+/// Bucket ms timestamps into a trailing year of daily counts, oldest first.
+/// Days with nothing are present with a count of 0 — a contribution calendar
+/// has to render the gaps, so the absence is data.
+fn calendar_from(timestamps: Vec<i64>) -> Vec<CalendarDay> {
+    use chrono::{Duration, TimeZone};
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for ms in timestamps {
+        if let Some(d) = Local.timestamp_millis_opt(ms).single() {
+            *counts.entry(d.format("%Y-%m-%d").to_string()).or_default() += 1;
+        }
+    }
+    let today = Local::now().date_naive();
+    (0..364)
+        .rev()
+        .map(|i| {
+            let date = (today - Duration::days(i)).format("%Y-%m-%d").to_string();
+            let count = counts.get(&date).copied().unwrap_or(0);
+            CalendarDay { date, count }
+        })
+        .collect()
+}
+
+/// The most useful single line from a failed job's log.
+///
+/// Prefers the first line that looks like an error, and falls back to the last
+/// non-empty line — a command that dies without saying "error" still leaves its
+/// last words. Truncated so a runaway line cannot bloat every list response.
+pub fn first_error_line(output: &str) -> Option<String> {
+    const MAX: usize = 200;
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let pick = lines
+        .iter()
+        .find(|l| {
+            let lower = l.to_ascii_lowercase();
+            ["error", "panicked", "fatal", "exception", "traceback", "failed"]
+                .iter()
+                .any(|k| lower.contains(k))
+        })
+        .or_else(|| lines.last())?;
+    let mut out = pick.to_string();
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX - 1).collect::<String>() + "…";
+    }
+    Some(out)
 }
 
 fn job_from_row(row: &sqlx::postgres::PgRow) -> Job {
@@ -907,10 +1214,14 @@ fn job_from_row(row: &sqlx::postgres::PgRow) -> Job {
         status: JobStatus::from_str(&row.get::<String, _>("status")),
         worker: row.get("worker"),
         worker_id: row.get("worker_id"),
+        ready_at: row.get("ready_at"),
+        requeue_count: row.get("requeue_count"),
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
         exit_code: row.get("exit_code"),
-        output: row.get("output"),
+        first_error: row.try_get("first_error").unwrap_or(None),
+        // absent from list queries by design; present on single-run/job reads
+        output: row.try_get("output").unwrap_or(None),
     }
 }
 
@@ -924,11 +1235,59 @@ fn run_from_row(row: &sqlx::postgres::PgRow) -> Run {
         repo: row.get("repo"),
         pipeline_file: row.get("pipeline_file"),
         trigger: TriggerKind::from_str(&row.get::<String, _>("trigger_kind")),
+        // try_get: runs created before the column existed have no branch, and
+        // "unknown" is the honest answer rather than a guessed default
+        branch: row.try_get::<Option<String>, _>("branch").ok().flatten(),
         commit,
         status: JobStatus::from_str(&row.get::<String, _>("status")),
         created_at: row.get("created_at"),
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
         jobs: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_error_line;
+
+    #[test]
+    fn prefers_the_first_line_that_looks_like_an_error() {
+        let log = "Compiling orchestrator\n   warning: unused\nerror[E0308]: mismatched types\n  --> src/x.rs:4";
+        assert_eq!(first_error_line(log).unwrap(), "error[E0308]: mismatched types");
+    }
+
+    #[test]
+    fn falls_back_to_the_last_line_when_nothing_says_error() {
+        // a command can die without ever printing the word "error"
+        let log = "running migrations\napplying 003_add_index\nkilled";
+        assert_eq!(first_error_line(log).unwrap(), "killed");
+    }
+
+    #[test]
+    fn ignores_blank_and_whitespace_lines() {
+        assert_eq!(first_error_line("\n\n   \n  boom  \n\n").unwrap(), "boom");
+    }
+
+    #[test]
+    fn empty_output_has_no_cause_rather_than_an_empty_one() {
+        assert!(first_error_line("").is_none());
+        assert!(first_error_line("   \n \n").is_none());
+    }
+
+    #[test]
+    fn a_runaway_line_is_truncated_so_it_cannot_bloat_list_responses() {
+        let long = format!("error: {}", "x".repeat(5_000));
+        let got = first_error_line(&long).unwrap();
+        assert_eq!(got.chars().count(), 200);
+        assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        // slicing by byte here would split a multi-byte char and panic
+        let long = format!("fatal: {}", "✕".repeat(400));
+        let got = first_error_line(&long).unwrap();
+        assert_eq!(got.chars().count(), 200);
     }
 }
