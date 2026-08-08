@@ -1,5 +1,6 @@
 # CI/CD Orchestrator
 
+
 Distributed CI/CD platform. A Rust **coordinator** plans pipelines and hands
 out jobs; Rust **workers** claim them and run each command on the FastAPI
 **command executor**. Pipelines are defined in `.orchestrator/actions.yml`
