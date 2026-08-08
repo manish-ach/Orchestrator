@@ -1,10 +1,9 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
   import { api } from '../lib/api';
   import AppShell from '../lib/components/AppShell.svelte';
   import Calendar from '../lib/components/Calendar.svelte';
   import { fmtDur } from '../lib/format';
-  import { startPolling } from '../lib/poll';
+  import { overview as live } from '../lib/live';
   import { route } from '../lib/router';
   import type { Insights, Overview } from '../lib/types';
 
@@ -21,7 +20,7 @@
     { days: 90, label: 'last 90d' },
   ];
 
-  let overview = $state<Overview | null>(null);
+  const overview = $derived($live);
   let data = $state<Insights | null>(null);
   let error = $state('');
   let loading = $state(true);
@@ -32,18 +31,10 @@
     location.hash = `/insights?range=${days}`;
   }
 
-  // The shell's live counters keep polling; the aggregates do not. A 90-day
-  // rollup does not change every three seconds, and re-fetching it on that
-  // cadence would be the page's most expensive habit for no new information.
-  const stop = startPolling(async () => {
-    try {
-      overview = await api.overview();
-    } catch {
-      /* the aggregates below carry their own error state */
-    }
-  });
-  onDestroy(stop);
-
+  // The shell's live counters come from the shared poller; the aggregates below
+  // deliberately do not follow it. A 90-day rollup does not change every three
+  // seconds, and re-fetching it on that cadence would be its most expensive
+  // habit for no new information.
   $effect(() => {
     const days = range;
     let stale = false;

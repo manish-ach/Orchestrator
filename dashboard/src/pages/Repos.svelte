@@ -5,6 +5,7 @@
   import FacetDropdown from '../lib/components/FacetDropdown.svelte';
   import Strip from '../lib/components/Strip.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
+  import { overview as live } from '../lib/live';
   import { now, startPolling } from '../lib/poll';
   import { route } from '../lib/router';
   import type { Overview, Repo, Run } from '../lib/types';
@@ -16,7 +17,7 @@
   // Pipelines are not a top-level page because a pipeline only means anything
   // inside the repo that defines it.
   let repos = $state<Repo[]>([]);
-  let overview = $state<Overview | null>(null);
+  const overview = $derived($live);
   let error = $state('');
   let query = $state('');
   let language = $state('all');
@@ -45,9 +46,7 @@
 
   const stop = startPolling(async () => {
     try {
-      const [r, o] = await Promise.all([api.repos(), api.overview()]);
-      repos = r;
-      overview = o;
+      repos = await api.repos();
       error = '';
     } catch (e) {
       error = `Cannot reach the data source (${(e as Error).message}). Retrying on the next poll.`;

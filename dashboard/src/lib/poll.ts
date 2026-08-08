@@ -6,7 +6,13 @@ export const now = readable(Date.now(), (set) => {
   return () => clearInterval(id);
 });
 
-/** Timestamp of the last successful fetch, for the "updated Ns ago" readout. */
+/**
+ * Timestamp of the last SUCCESSFUL shared-state poll, for the "updated Ns ago"
+ * readout and the status rail's staleness check. Written only by `live.ts`,
+ * and only when the request actually succeeded — page-local pollers must not
+ * touch it, or an outage would keep looking fresh because some unrelated
+ * request happened to return.
+ */
 export const lastFetch = writable(Date.now());
 
 /**
@@ -15,7 +21,7 @@ export const lastFetch = writable(Date.now());
  */
 export function startPolling(fn: () => void | Promise<void>, ms = 3000): () => void {
   const run = () => {
-    void Promise.resolve(fn()).then(() => lastFetch.set(Date.now()));
+    void Promise.resolve(fn());
   };
   run();
   const id = setInterval(() => {

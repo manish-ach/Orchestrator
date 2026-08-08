@@ -3,8 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>orchestrator</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236b7d2a'/%3E%3C/svg%3E">
+<title>Orchestrator</title>
+<!-- Served from public/, so it is a real file the browser can cache rather than
+     a data: URI re-parsed on every load. Safari still wants a mask-icon for
+     pinned tabs; the theme-color tints the tab strip on mobile Chrome. -->
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="mask-icon" href="/favicon.svg" color="#1c2116">
+<meta name="theme-color" content="#1c2116">
 </head>
 <body>
 <div id="app"></div>

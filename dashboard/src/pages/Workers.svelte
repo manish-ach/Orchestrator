@@ -7,6 +7,7 @@
   import FacetDropdown from '../lib/components/FacetDropdown.svelte';
   import OsLogo from '../lib/components/OsLogo.svelte';
   import { ago, fmtDur, fmtUptime, GLYPH } from '../lib/format';
+  import { overview as live } from '../lib/live';
   import { now, startPolling } from '../lib/poll';
   import { route } from '../lib/router';
   import type { Overview, Worker, WorkerActivity, WorkerStatsSeries } from '../lib/types';
@@ -23,7 +24,7 @@
 
   const WINDOW_MS = 15 * 60 * 1000;
 
-  let overview = $state<Overview | null>(null);
+  const overview = $derived($live);
   let series = $state<WorkerStatsSeries[]>([]);
   let act = $state<WorkerActivity | null>(null);
   let error = $state('');
@@ -37,8 +38,7 @@
 
   const stop = startPolling(async () => {
     try {
-      const [o, s] = await Promise.all([api.overview(), api.workerStats()]);
-      overview = o;
+      const s = await api.workerStats();
       series = s;
       error = '';
     } catch (e) {

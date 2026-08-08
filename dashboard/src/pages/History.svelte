@@ -1,19 +1,21 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
-  import { api } from '../lib/api';
   import AppShell from '../lib/components/AppShell.svelte';
   import FacetDropdown from '../lib/components/FacetDropdown.svelte';
   import Strip from '../lib/components/Strip.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
-  import { now, startPolling } from '../lib/poll';
+  import { liveError, overview as live } from '../lib/live';
+  import { now } from '../lib/poll';
   import { route } from '../lib/router';
   import type { Job, Overview, Run, RunStatus } from '../lib/types';
 
   // The event log: every run, newest first. Identity varies row to row — a
   // different repo, pipeline and author each time — so those columns earn their
   // place here in a way they would not inside one pipeline's own history.
-  let overview = $state<Overview | null>(null);
-  let error = $state('');
+  // Shared across pages so a route change renders from what is already known
+  // instead of blanking and re-fetching. `overview` stays a plain name so every
+  // reference below reads the same as before.
+  const overview = $derived($live);
+  const error = $derived($liveError);
   let shown = $state(30);
   let sel = $state(0);
   let listEl = $state<HTMLElement | null>(null);
@@ -50,16 +52,6 @@
     history.replaceState(null, '', `#/runs${s ? `?${s}` : ''}`);
   }
 
-  const stop = startPolling(async () => {
-    try {
-      overview = await api.overview();
-      error = '';
-    } catch (e) {
-      error = `Cannot reach the data source (${(e as Error).message}). Retrying on the next poll.`;
-    }
-  });
-  onDestroy(stop);
-
   const runs = $derived([...(overview?.runs ?? [])].sort((a, b) => b.started_at - a.started_at));
   const repoOptions = $derived(['all', ...new Set(runs.map((r) => r.repo).filter(Boolean))]);
   const triggerOptions = $derived(['all', ...new Set(runs.map((r) => r.trigger))]);
@@ -67,11 +59,28 @@
   // under "unknown" rather than silently dropped from every branch filter.
   const branchOptions = $derived(['all', ...new Set(runs.map((r) => r.branch ?? 'unknown'))]);
 
+  // Everything EXCEPT the status filter. Faceted-search rule: a facet's counts
+  // show what you would get by picking it while the other facets stay put — so
+  // clicking "failed 7" always yields exactly 7 rows. Counting all runs here
+  // instead (the old behaviour) made the chips disagree with both the summary
+  // line and the list whenever the window or repo filter was narrowing.
+  const scoped = $derived.by(() => {
+    const q = query.trim().toLowerCase();
+    return runs.filter(
+      (r) =>
+        (repo === 'all' || r.repo === repo) &&
+        (branch === 'all' || (r.branch ?? 'unknown') === branch) &&
+        (trigger === 'all' || r.trigger === trigger) &&
+        r.started_at >= cutoff &&
+        (!q || matches(r, q)),
+    );
+  });
+
   const counts = $derived({
-    all: runs.length,
-    passed: runs.filter((r) => r.status === 'passed').length,
-    failed: runs.filter((r) => r.status === 'failed').length,
-    running: runs.filter((r) => r.status === 'running').length,
+    all: scoped.length,
+    passed: scoped.filter((r) => r.status === 'passed').length,
+    failed: scoped.filter((r) => r.status === 'failed').length,
+    running: scoped.filter((r) => r.status === 'running').length,
   });
 
   const runDur = (r: Run) => (r.finished_at ?? $now) - r.started_at;
@@ -93,18 +102,7 @@
           : 0,
   );
 
-  const filtered = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    return runs.filter(
-      (r) =>
-        (status === 'all' || r.status === status) &&
-        (repo === 'all' || r.repo === repo) &&
-        (branch === 'all' || (r.branch ?? 'unknown') === branch) &&
-        (trigger === 'all' || r.trigger === trigger) &&
-        r.started_at >= cutoff &&
-        (!q || matches(r, q)),
-    );
-  });
+  const filtered = $derived(scoped.filter((r) => status === 'all' || r.status === status));
   const visible = $derived(filtered.slice(0, shown));
 
   const medianDur = $derived.by(() => {
@@ -311,7 +309,9 @@
       </div>
 
       <div class="lfoot">
-        <span>Showing {visible.length} of {filtered.length} matching · {runs.length} total</span>
+        <span>
+          Showing {visible.length} of {filtered.length} matching · {runs.length}{runs.length >= 200 ? '+' : ''} loaded
+        </span>
         {#if visible.length < filtered.length}
           <button class="more" onclick={() => (shown += 30)}>Load 30 more →</button>
         {/if}

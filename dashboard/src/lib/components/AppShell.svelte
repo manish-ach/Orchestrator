@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { MODE } from '../api';
+  import { api, MODE } from '../api';
   import { lastFetch, now } from '../poll';
   import type { Overview } from '../types';
   import Palette from './Palette.svelte';
@@ -57,9 +57,28 @@
     { key: 'insights', label: 'Insights', href: '#/insights', group: 'Analysis' },
   ] as const;
 
+  // Registered repositories, not "distinct repos seen in runs" — those differ
+  // the moment a repo is registered but never pushed to, and the nav would then
+  // contradict the Repositories page. The nav owns this number, so it fetches
+  // it, on its own slow cadence: repos change on human timescales, not the 3s
+  // poll the run data needs.
+  let repoCount = $state<number | null>(null);
+  $effect(() => {
+    let stop = false;
+    const load = () => api.repos().then((r) => !stop && (repoCount = r.length)).catch(() => {});
+    load();
+    const id = setInterval(() => !document.hidden && load(), 30_000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  });
+
   const counts = $derived<Record<string, string>>({
-    runs: overview ? String(overview.runs.length) : '',
-    repos: overview ? String(new Set(overview.runs.map((r) => r.repo)).size) : '',
+    // `/api/runs` caps at 200; past that this is a floor, and says so rather
+    // than quietly under-reporting
+    runs: overview ? `${overview.runs.length}${overview.runs.length >= 200 ? '+' : ''}` : '',
+    repos: repoCount === null ? '' : String(repoCount),
     workers: total ? `${online}/${total}` : '',
   });
 </script>

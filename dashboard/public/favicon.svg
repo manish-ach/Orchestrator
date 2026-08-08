@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- The same mark as the sidebar brand: one node fanning out to two, which is
+       what this thing does. Kept as a real file rather than a data: URI so it
+       can carry detail at 32px — the old inline version was a bare square.
+       Colours are literal, not var(): a favicon renders outside the document. -->
+  <rect width="32" height="32" rx="7" fill="#c8dc4f"/>
+  <g fill="none" stroke="#1c2116" stroke-width="2.2" stroke-linecap="round">
+    <path d="M11 16h4c2.5 0 2.5-5 5-5M11 16h4c2.5 0 2.5 5 5 5"/>
+  </g>
+  <g fill="#1c2116">
+    <circle cx="9.5" cy="16" r="3"/>
+    <circle cx="21.5" cy="11" r="3"/>
+    <circle cx="21.5" cy="21" r="3"/>
+  </g>
+</svg>

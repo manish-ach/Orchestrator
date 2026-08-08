@@ -7,13 +7,14 @@
   import Sparkline from '../lib/components/Sparkline.svelte';
   import Strip from '../lib/components/Strip.svelte';
   import { ago, fmtDur, GLYPH } from '../lib/format';
+  import { overview as live } from '../lib/live';
   import { now, startPolling } from '../lib/poll';
   import type { Overview, Run, WorkerStatsSeries } from '../lib/types';
 
   // The control centre answers "is anything on fire, right now". Anything that
   // needs history, a full list or a comparison belongs to the page that owns it,
   // so there are deliberately no "view all" links here.
-  let overview = $state<Overview | null>(null);
+  const overview = $derived($live);
   let series = $state<WorkerStatsSeries[]>([]);
   let error = $state('');
   let picked = $state<number | null>(null);
@@ -21,8 +22,7 @@
 
   const stop = startPolling(async () => {
     try {
-      const [o, s] = await Promise.all([api.overview(), api.workerStats()]);
-      overview = o;
+      const s = await api.workerStats();
       series = s;
       error = '';
     } catch (e) {

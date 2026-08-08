@@ -22,9 +22,10 @@ const MOCK_POLL_MS = 700;
  * Stream `job`'s log, calling `onText` with each new chunk (never the whole log
  * again) and `onEnd` once the job is terminal.
  *
- * EventSource cannot send an Authorization header, so on a coordinator with
- * dashboard auth enabled the stream is refused and this falls back to polling —
- * a slower log rather than no log.
+ * EventSource cannot send an Authorization header, so when a session token
+ * exists it goes in the query string — the coordinator accepts it there for
+ * this one endpoint. That keeps live logs live with dashboard auth turned on,
+ * instead of silently degrading to polling.
  */
 export function streamJobLog(
   runId: number,
@@ -32,10 +33,13 @@ export function streamJobLog(
   onText: (chunk: string) => void,
   onEnd?: () => void,
 ): LogStream {
-  if (MODE === 'mock' || getToken()) return pollFallback(runId, jobId, onText, onEnd);
+  if (MODE === 'mock') return pollFallback(runId, jobId, onText, onEnd);
+
+  const token = getToken();
+  const url = `${API_BASE}${ENDPOINTS.jobLogStream(jobId)}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
 
   let closed = false;
-  const src = new EventSource(`${API_BASE}${ENDPOINTS.jobLogStream(jobId)}`);
+  const src = new EventSource(url);
   let fallback: LogStream | null = null;
 
   src.addEventListener('log', (e) => onText((e as MessageEvent<string>).data));

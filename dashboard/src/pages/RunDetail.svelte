@@ -7,6 +7,7 @@
   import { ago, fmtDur, GLYPH } from '../lib/format';
   import { classify, parseSteps, type LineKind } from '../lib/logsteps';
   import { streamJobLog, type LogStream } from '../lib/logstream';
+  import { overview as live } from '../lib/live';
   import { now, startPolling } from '../lib/poll';
   import { highlightYaml } from '../lib/yamlhl';
   import type { Job, JobStatus, Overview, Run } from '../lib/types';
@@ -27,7 +28,7 @@
   let { id, initialJob = null }: { id: string; initialJob?: string | null } = $props();
 
   let run = $state<Run | null>(null);
-  let overview = $state<Overview | null>(null);
+  const overview = $derived($live);
   let error = $state('');
 
   /** 'flow' | 'yaml' | a job id */
@@ -42,9 +43,8 @@
 
   const stop = startPolling(async () => {
     try {
-      const [r, o] = await Promise.all([api.run(id), api.overview()]);
+      const r = await api.run(id);
       run = r;
-      overview = o;
       error = '';
       if (r && deepLink !== null) {
         const job = r.jobs.find((j) => j.id === deepLink);
@@ -102,10 +102,18 @@
   let streaming = $state(false);
   let logBody = $state<HTMLElement | null>(null);
 
+  // The ids are derived as primitives ON PURPOSE. Reading `run?.id` inside the
+  // effect would subscribe it to `run` itself, and the 3s poll replaces that
+  // object every time — so the effect tore down, cleared logText and reopened
+  // the stream three times a minute, which is exactly what made the terminal
+  // flash. A derived primitive only notifies when the number actually changes.
+  const streamRunId = $derived(run?.id ?? null);
+  const streamJobId = $derived(typeof sel === 'number' ? sel : null);
+
   $effect(() => {
-    const r = run?.id;
-    const j = selJob?.id;
-    if (!r || !j) {
+    const r = streamRunId;
+    const j = streamJobId;
+    if (r === null || j === null) {
       logText = '';
       streaming = false;
       return;
