@@ -380,10 +380,16 @@ async fn forgejo_webhook(
         .await
         .map_err(internal)?
         .into_iter()
+        // Match on owner/name parsed from the remote, not a raw suffix compare.
+        // A remote registered as ".../owner/repo.git" does not end with
+        // "owner/repo", so the old check silently rejected every push from it
+        // while repo discovery — which parses the URL properly — kept working.
+        // The symptom was a pipeline that appeared in the dashboard but never ran.
         .find(|r| {
             r.remote
                 .as_deref()
-                .map(|rem| rem.to_lowercase().ends_with(&full_name.to_lowercase()))
+                .and_then(forgejo::parse_remote)
+                .map(|rr| format!("{}/{}", rr.owner, rr.name).eq_ignore_ascii_case(full_name))
                 .unwrap_or(false)
         })
         .ok_or((

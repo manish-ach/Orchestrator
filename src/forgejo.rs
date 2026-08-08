@@ -166,3 +166,34 @@ pub async fn fetch_raw_file(client: &Client, remote: &str, branch: &str, path: &
     }
     resp.text().await.ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_remote;
+
+    /// The webhook matcher resolves a repo by comparing owner/name from the
+    /// registered remote against the payload's `full_name`. Every one of these
+    /// spellings must land on the same pair, because a user can register any
+    /// of them and Forgejo always sends the bare "owner/name".
+    #[test]
+    fn remote_spellings_all_resolve_to_the_same_repo() {
+        let expected = ("Manish", "orchestrator-run-test");
+        for remote in [
+            "https://git.example.com/Manish/orchestrator-run-test",
+            "https://git.example.com/Manish/orchestrator-run-test/",
+            "https://git.example.com/Manish/orchestrator-run-test.git",
+            "  https://git.example.com/Manish/orchestrator-run-test.git  ",
+            "http://git.example.com/Manish/orchestrator-run-test",
+        ] {
+            let r = parse_remote(remote).unwrap_or_else(|| panic!("failed to parse {remote}"));
+            assert_eq!((r.owner.as_str(), r.name.as_str()), expected, "for {remote}");
+        }
+    }
+
+    #[test]
+    fn rejects_urls_that_are_not_a_repo() {
+        for bad in ["", "not-a-url", "https://git.example.com", "https://git.example.com/owner"] {
+            assert!(parse_remote(bad).is_none(), "{bad} should not parse");
+        }
+    }
+}
