@@ -11,3 +11,9 @@ artifacts/
 # staged by compile-release/self-deploy — never committed
 prebuilt/
 prebuilt.tar.gz
+
+# IDE / editor and local agent tooling
+.idea/
+.vscode/
+.claude/
+.impeccable/
