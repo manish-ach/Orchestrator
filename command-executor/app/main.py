@@ -54,6 +54,9 @@ class RunRequest(BaseModel):
     workspace: str | None = None
     repo_url: str | None = None
     commit_sha: str | None = None
+    # the pushed branch, checked out when the trigger carried no sha
+    # (manual and scheduled runs deliberately record none)
+    branch: str | None = None
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     upload_url: str | None = None
@@ -76,7 +79,9 @@ async def run_sync(req: RunRequest):
     command = f"sh -xc {shlex.quote(req.command)}"
     if req.workspace:
         try:
-            ws = await runner.prepare_workspace(req.workspace, req.repo_url, req.commit_sha)
+            ws = await runner.prepare_workspace(
+                req.workspace, req.repo_url, req.commit_sha, req.branch
+            )
             for url in req.inputs:
                 await runner.fetch_artifacts(url, ws)
         except runner.WorkspaceError as e:

@@ -432,6 +432,7 @@ async fn run_job(
         workspace,
         repo_url: job.env.get("REPO_URL").cloned(),
         commit_sha: job.env.get("COMMIT_SHA").cloned(),
+        branch: job.env.get("REPO_BRANCH").cloned(),
         inputs,
         outputs: job.artifacts.clone(),
         upload_url,

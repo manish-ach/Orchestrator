@@ -274,6 +274,9 @@ pub struct RunRequest {
     pub workspace: Option<String>,
     pub repo_url: Option<String>,
     pub commit_sha: Option<String>,
+    /// pushed branch, checked out when the trigger carried no sha —
+    /// manual and scheduled runs record none on purpose
+    pub branch: Option<String>,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub upload_url: Option<String>,

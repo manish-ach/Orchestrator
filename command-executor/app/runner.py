@@ -7,6 +7,7 @@ import asyncio
 import io
 import json
 import os
+import shutil
 import tarfile
 import time
 import uuid
@@ -38,22 +39,63 @@ async def _sh(command: str, cwd: str | None = None) -> tuple[int, str]:
     return proc.returncode or 0, out.decode(errors="replace")
 
 
-async def prepare_workspace(name: str, repo_url: str | None, commit_sha: str | None) -> Path:
+async def _matches(ws: Path, repo_url: str, commit_sha: str | None, branch: str | None) -> bool:
+    """Is this existing directory already the checkout the job asked for?
+
+    A workspace is reused by every later job of the same run, so it has to be
+    proved right rather than assumed: a stale directory left by an earlier run
+    that happened to take the same id belongs to a different repo entirely, and
+    handing it back silently is what makes a job fail as if its own code were
+    broken."""
+    code, origin = await _sh("git remote get-url origin", cwd=str(ws))
+    if code != 0 or origin.strip() != repo_url:
+        return False
+    if commit_sha:
+        code, head = await _sh("git rev-parse HEAD", cwd=str(ws))
+        return code == 0 and head.strip() == commit_sha
+    if branch:
+        code, at = await _sh("git rev-parse --abbrev-ref HEAD", cwd=str(ws))
+        return code == 0 and at.strip() == branch
+    return True
+
+
+async def prepare_workspace(
+    name: str, repo_url: str | None, commit_sha: str | None, branch: str | None = None
+) -> Path:
     """Materialize a per-run workspace on THIS machine: clone once, reuse
-    for every later job of the run that lands here."""
+    for every later job of the run that lands here.
+
+    Never returns a directory that is not the requested checkout. Without a
+    repo to clone there is nothing to run against, so that is an error and not
+    an empty directory — a job that runs in an empty workspace fails somewhere
+    far downstream, wearing the mask of a bug in the code under test."""
+    if not repo_url:
+        raise WorkspaceError(
+            "no REPO_URL for this run — register the repo with a remote in the "
+            "dashboard, or the job would run against an empty workspace"
+        )
+
     ws = Path(settings.WORKSPACES_DIR) / name
     async with _WS_LOCKS[name]:
+        if ws.exists() and not await _matches(ws, repo_url, commit_sha, branch):
+            # only ever inside WORKSPACES_DIR, and only a directory already
+            # proved useless — the run's real output lives on the coordinator
+            if ws.resolve().parent != Path(settings.WORKSPACES_DIR).resolve():
+                raise WorkspaceError(f"refusing to replace '{ws}': outside the workspaces directory")
+            shutil.rmtree(ws)
+
         if not ws.exists():
-            if not repo_url:
-                ws.mkdir(parents=True, exist_ok=True)
-                return ws
             code, out = await _sh(f'git clone "{repo_url}" "{ws}"')
             if code != 0:
                 raise WorkspaceError(f"workspace clone failed: {out.strip()}")
-            if commit_sha:
-                code, out = await _sh(f'git checkout -q "{commit_sha}"', cwd=str(ws))
+            # a sha when the trigger carried one, else the pushed branch: a
+            # clone lands on the remote's default branch, so skipping this
+            # tests main while REPO_BRANCH claims otherwise
+            target = commit_sha or branch
+            if target:
+                code, out = await _sh(f'git checkout -q "{target}"', cwd=str(ws))
                 if code != 0:
-                    raise WorkspaceError(f"checkout of {commit_sha[:7]} failed: {out.strip()}")
+                    raise WorkspaceError(f"checkout of '{target}' failed: {out.strip()}")
     return ws
 
 

@@ -59,6 +59,16 @@ services:
     restart: unless-stopped
     ports:
       - "9000:9000"
+    environment:
+      # write-scoped Forgejo token, read from the server's gitignored .env.
+      # Jobs that merge a branch into main (tools/merge_to_main.py) call the
+      # Forgejo API with it — nothing here ever pushes over git.
+      FORGEJO_TOKEN: ${FORGEJO_TOKEN:-}
+    volumes:
+      # per-run clones. On its own layer they vanish with every rebuild, and
+      # worse, they outlive a coordinator database reset — run ids then replay
+      # over directories still holding a different repo.
+      - workspaces:/app/storage/workspaces
 
   worker:
     build:
@@ -115,3 +125,4 @@ volumes:
   redisdata:
   artifacts:
   workerstate:
+  workspaces:
