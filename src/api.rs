@@ -22,9 +22,6 @@ fn internal(e: String) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e)
 }
 
-/// Dashboard auth is on when both env vars are set; workers and webhooks
-/// are never behind it (they authenticate machines, not people — see the
-/// route split in `router`).
 fn dashboard_creds() -> Option<(String, String)> {
     let user = std::env::var("DASHBOARD_USERNAME").ok().filter(|s| !s.is_empty())?;
     let pass = std::env::var("DASHBOARD_PASSWORD").ok().filter(|s| !s.is_empty())?;
@@ -47,11 +44,6 @@ async fn require_session(
         .unwrap_or("")
         .to_string();
 
-    // EventSource cannot set headers, so the log stream — and ONLY the log
-    // stream — also accepts the session token as a query parameter. Without
-    // this, turning on dashboard auth would silently downgrade live logs to
-    // polling. Kept to one path on purpose: tokens in URLs end up in access
-    // logs, and that is a cost worth paying once, not everywhere.
     let query_token = if req.uri().path().ends_with("/logs/stream") {
         req.uri()
             .query()
